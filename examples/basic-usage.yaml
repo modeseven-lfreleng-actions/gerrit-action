@@ -1,0 +1,46 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+
+# Basic Gerrit Server Usage Example
+name: 'Gerrit Basic Example'
+
+"on":
+  workflow_dispatch:
+  push:
+    branches: ['main']
+
+jobs:
+  test-with-gerrit:
+    name: 'Test with Gerrit mirror'
+    runs-on: 'ubuntu-latest'
+    steps:
+      - name: 'Checkout code'
+        uses: actions/checkout@v4
+
+      - name: 'Start Gerrit mirror'
+        id: gerrit
+        uses: lfreleng-actions/gerrit-server-action@main
+        with:
+          gerrit_setup: |
+            [{
+              "project": "ONAP",
+              "slug": "onap",
+              "gerrit": "gerrit.onap.org"
+            }]
+          ssh_private_key: ${{ secrets.GERRIT_SSH_KEY }}
+          sync_on_startup: true
+
+      - name: 'Use Gerrit'
+        run: |
+          echo "Gerrit is available at: ${{ steps.gerrit.outputs.gerrit_urls }}"
+
+          # Access Gerrit API
+          curl http://localhost:8080/config/server/version
+
+          # Clone a repository
+          git clone http://localhost:8080/my-project
+          cd my-project
+          # Do your testing...
+
+      # Container cleanup happens automatically when job completes

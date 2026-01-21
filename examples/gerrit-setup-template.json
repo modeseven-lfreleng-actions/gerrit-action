@@ -1,0 +1,12 @@
+[
+  {
+    "project": "ONAP",
+    "slug": "onap",
+    "gerrit": "gerrit.onap.org"
+  },
+  {
+    "project": "OpenDaylight",
+    "slug": "opendaylight",
+    "gerrit": "git.opendaylight.org"
+  }
+]

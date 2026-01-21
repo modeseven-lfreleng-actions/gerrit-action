@@ -2,36 +2,365 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# gerrit-server-action
+name: "⚙️ Gerrit Server Container"
+description: |
+  Starts Gerrit server(s) with pull-replication plugin for
+  mirroring production Gerrit instances
 
 inputs:
-  input:
-    description: "Description of input"
+  # Mandatory
+  gerrit_setup:
+    description: |
+      JSON array defining Gerrit instances to start.
+      Format: [{"project": "ONAP", "slug": "onap", "gerrit": "gerrit.onap.org"}]
+      Can be overridden by repository variable GERRIT_SETUP
     required: true
 
+  # Authentication (one method required)
+  ssh_private_key:
+    description: "SSH private key for Gerrit sync authentication"
+    required: false
+  ssh_known_hosts:
+    description: |
+      SSH known_hosts entries for Gerrit servers
+      (auto-generated if not provided)
+    required: false
+  http_username:
+    description: |
+      HTTP basic auth username
+      (required if auth_type=http_basic)
+    required: false
+  http_password:
+    description: |
+      HTTP basic auth password
+      (required if auth_type=http_basic)
+    required: false
+  bearer_token:
+    description: |
+      Bearer token for HTTP authentication
+      (required if auth_type=bearer_token)
+    required: false
+
+  # Optional - Gerrit Configuration
+  gerrit_version:
+    description: "Gerrit Docker image version tag"
+    required: false
+    default: '3.13.1-ubuntu24'
+  plugin_version:
+    description: "Pull-replication plugin version/branch"
+    required: false
+    default: 'stable-3.13'
+  base_http_port:
+    description: "Starting HTTP port (increments for multi-instance)"
+    required: false
+    default: '8080'
+  base_ssh_port:
+    description: "Starting SSH port (increments for multi-instance)"
+    required: false
+    default: '29418'
+  auth_type:
+    description: "Authentication method: ssh, http_basic, or bearer_token"
+    required: false
+    default: 'ssh'
+
+  # Optional - Replication Settings
+  sync_on_startup:
+    description: "Trigger replication after startup"
+    required: false
+    default: 'true'
+  replication_timeout:
+    description: "Timeout for initial replication sync (in seconds)"
+    required: false
+    default: '600'
+  sync_refs:
+    description: "Refs to synchronize (default: all branches, tags, changes)"
+    required: false
+    default: '+refs/heads/*:refs/heads/*,+refs/tags/*:refs/tags/*,+refs/changes/*:refs/changes/*'
+  replication_threads:
+    description: "Number of replication threads per instance"
+    required: false
+    default: '4'
+
+  # Optional - Container Management
+  exit:
+    description: "Stop containers when the job completes"
+    required: false
+    default: 'true'
+  check_service:
+    description: "Verify service availability after startup"
+    required: false
+    default: 'true'
+  enable_cache:
+    description: "Enable Docker layer and dependency caching"
+    required: false
+    default: 'true'
+  cache_key_suffix:
+    description: "Extra suffix for cache keys"
+    required: false
+    default: ''
+
+  # Optional - Advanced
+  debug:
+    description: "Enables debugging output"
+    required: false
+    default: 'false'
+  additional_plugins:
+    description: "Comma-separated list of extra plugin URLs to install"
+    required: false
+  gerrit_init_args:
+    description: "Extra arguments for gerrit.war init"
+    required: false
+  skip_plugin_install:
+    description: "Skip pull-replication plugin installation (testing)"
+    required: false
+    default: 'false'
+
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  container_ids:
+    description: "JSON array of running container IDs"
+    value: ${{ steps.collect-outputs.outputs.container_ids }}
+  container_ips:
+    description: "JSON array of container IP addresses"
+    value: ${{ steps.collect-outputs.outputs.container_ips }}
+  instances:
+    description: |
+      JSON object mapping slug to instance details
+      {cid, ip, http_port, ssh_port, url}
+    value: ${{ steps.collect-outputs.outputs.instances }}
+  gerrit_urls:
+    description: "Comma-separated list of Gerrit HTTP URLs"
+    value: ${{ steps.collect-outputs.outputs.gerrit_urls }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: 'Setup action/environment'
+      id: setup
       shell: bash
       run: |
-        # Friendly Name
-        input="${{ inputs.input }}"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Setup Gerrit server action environment and validate configuration
+        set -euo pipefail
+
+        echo "# Gerrit Server Action ⚙️" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        # Validate required inputs
+        if [ -z "${{ inputs.gerrit_setup }}" ]; then
+          echo "::error::gerrit_setup is a mandatory input ❌"
           exit 1
         fi
 
-        echo "output=$input" >> "$GITHUB_ENV"
-        echo "output=$input" >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+        # Validate JSON format
+        if ! echo '${{ inputs.gerrit_setup }}' | jq empty 2>/dev/null; then
+          echo "::error::gerrit_setup is not valid JSON ❌"
+          exit 1
+        fi
+
+        # Validate authentication
+        AUTH_TYPE="${{ inputs.auth_type }}"
+        case "$AUTH_TYPE" in
+          ssh)
+            if [ -z "${{ inputs.ssh_private_key }}" ]; then
+              echo "::error::ssh_private_key required when auth_type=ssh ❌"
+              exit 1
+            fi
+            ;;
+          http_basic)
+            if [ -z "${{ inputs.http_username }}" ] || \
+               [ -z "${{ inputs.http_password }}" ]; then
+              echo "::error::http_username and http_password required when auth_type=http_basic ❌"
+              exit 1
+            fi
+            ;;
+          bearer_token)
+            if [ -z "${{ inputs.bearer_token }}" ]; then
+              echo "::error::bearer_token required when auth_type=bearer_token ❌"
+              exit 1
+            fi
+            ;;
+          *)
+            echo "::error::Invalid auth_type: $AUTH_TYPE ❌"
+            exit 1
+            ;;
+        esac
+
+        # Validate port numbers
+        if ! [[ "${{ inputs.base_http_port }}" =~ ^[0-9]+$ ]]; then
+          echo "::error::base_http_port must be a valid number ❌"
+          exit 1
+        fi
+        if ! [[ "${{ inputs.base_ssh_port }}" =~ ^[0-9]+$ ]]; then
+          echo "::error::base_ssh_port must be a valid number ❌"
+          exit 1
+        fi
+
+        # Create working directory
+        WORK_DIR="/tmp/gerrit-action-$$"
+        mkdir -p "$WORK_DIR"
+        echo "WORK_DIR=$WORK_DIR" >> "$GITHUB_ENV"
+        echo "Working directory: $WORK_DIR" >> "$GITHUB_STEP_SUMMARY"
+
+        # Display configuration
+        echo "**Configuration** ⚙️" >> "$GITHUB_STEP_SUMMARY"
+        echo "- Gerrit version: \`${{ inputs.gerrit_version }}\`" \
+          >> "$GITHUB_STEP_SUMMARY"
+        echo "- Plugin version: \`${{ inputs.plugin_version }}\`" \
+          >> "$GITHUB_STEP_SUMMARY"
+        echo "- Auth type: \`${{ inputs.auth_type }}\`" \
+          >> "$GITHUB_STEP_SUMMARY"
+        echo "- Sync on startup: \`${{ inputs.sync_on_startup }}\`" \
+          >> "$GITHUB_STEP_SUMMARY"
+        echo "- Caching enabled: \`${{ inputs.enable_cache }}\`" \
+          >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        # Parse instance count
+        INSTANCE_COUNT=$(echo '${{ inputs.gerrit_setup }}' | jq '. | length')
+        echo "INSTANCE_COUNT=$INSTANCE_COUNT" >> "$GITHUB_ENV"
+        echo "**Instances to start:** $INSTANCE_COUNT" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+    # Docker Buildx with caching support
+    - name: 'Docker Buildx'
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      with:
+        version: latest
+        driver-opts: |
+          image=moby/buildkit:latest
+          network=host
+
+    # Cache Docker layers for faster builds
+    - name: 'Cache Docker layers'
+      if: inputs.enable_cache == 'true'
+      uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+      with:
+        path: /tmp/.buildx-cache
+        key: gerrit-docker-${{ runner.os }}-${{ inputs.gerrit_version }}${{ inputs.cache_key_suffix }}
+        restore-keys: |
+          gerrit-docker-${{ runner.os }}-${{ inputs.gerrit_version }}
+          gerrit-docker-${{ runner.os }}-
+          gerrit-docker-
+
+    # Cache plugin downloads
+    - name: 'Cache plugin downloads'
+      if: inputs.enable_cache == 'true' && inputs.skip_plugin_install != 'true'
+      uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+      with:
+        path: /tmp/gerrit-plugins
+        key: gerrit-plugins-${{ inputs.plugin_version }}${{ inputs.cache_key_suffix }}
+        restore-keys: |
+          gerrit-plugins-${{ inputs.plugin_version }}
+          gerrit-plugins-
+
+    # Pre-pull Gerrit Docker image
+    - name: 'Pre-pull Gerrit image'
+      if: inputs.enable_cache == 'true'
+      shell: bash
+      run: |
+        # Pre-pull Gerrit image for caching
+        echo "Pulling: gerritcodereview/gerrit:${{ inputs.gerrit_version }}"
+        docker pull gerritcodereview/gerrit:${{ inputs.gerrit_version }} || {
+          echo "Warning: Failed to pre-pull image, will attempt during run"
+        }
+
+    # Start Gerrit instances
+    - name: 'Start Gerrit instances'
+      id: start-instances
+      shell: bash
+      env:
+        GERRIT_SETUP: ${{ inputs.gerrit_setup }}
+        SSH_PRIVATE_KEY: ${{ inputs.ssh_private_key }}
+        SSH_KNOWN_HOSTS: ${{ inputs.ssh_known_hosts }}
+        HTTP_USERNAME: ${{ inputs.http_username }}
+        HTTP_PASSWORD: ${{ inputs.http_password }}
+        BEARER_TOKEN: ${{ inputs.bearer_token }}
+        AUTH_TYPE: ${{ inputs.auth_type }}
+        GERRIT_VERSION: ${{ inputs.gerrit_version }}
+        PLUGIN_VERSION: ${{ inputs.plugin_version }}
+        BASE_HTTP_PORT: ${{ inputs.base_http_port }}
+        BASE_SSH_PORT: ${{ inputs.base_ssh_port }}
+        SYNC_REFS: ${{ inputs.sync_refs }}
+        REPLICATION_THREADS: ${{ inputs.replication_threads }}
+        SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
+        REPLICATION_TIMEOUT: ${{ inputs.replication_timeout }}
+        SKIP_PLUGIN_INSTALL: ${{ inputs.skip_plugin_install }}
+        ADDITIONAL_PLUGINS: ${{ inputs.additional_plugins }}
+        GERRIT_INIT_ARGS: ${{ inputs.gerrit_init_args }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Start Gerrit instances
+        set -euo pipefail
+
+        source "${{ github.action_path }}/scripts/start-instances.sh"
+
+    # Check service availability
+    - name: "Check Gerrit service availability"
+      if: inputs.check_service == 'true'
+      shell: bash
+      env:
+        SKIP_PLUGIN_INSTALL: ${{ inputs.skip_plugin_install }}
+      run: |
+        # Check Gerrit service availability
+        set -euo pipefail
+
+        source "${{ github.action_path }}/scripts/check-services.sh"
+
+    # Trigger initial replication
+    - name: "Trigger initial replication"
+      if: inputs.sync_on_startup == 'true'
+      shell: bash
+      env:
+        SKIP_PLUGIN_INSTALL: ${{ inputs.skip_plugin_install }}
+        AUTH_TYPE: ${{ inputs.auth_type }}
+        SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
+      run: |
+        # Trigger initial replication
+        set -euo pipefail
+
+        source "${{ github.action_path }}/scripts/trigger-replication.sh"
+
+    # Collect outputs
+    - name: "Collect outputs"
+      id: collect-outputs
+      shell: bash
+      run: |
+        # Collect outputs
+        set -euo pipefail
+
+        source "${{ github.action_path }}/scripts/collect-outputs.sh"
+
+    # Terminate containers when finished
+    - name: "Terminate containers when finished"
+      if: inputs.exit == 'true'
+      shell: bash
+      env:
+        ENABLE_CACHE: ${{ inputs.enable_cache }}
+      run: |
+        # Terminate containers when finished
+        set -euo pipefail
+
+        source "${{ github.action_path }}/scripts/cleanup.sh"
+
+    # Container persistence message
+    - name: "Containers will continue/persist"
+      if: inputs.exit != 'true'
+      shell: bash
+      run: |
+        # Containers will continue/persist
+        echo "**Containers Status** 🐳" >> "$GITHUB_STEP_SUMMARY"
+        echo "Containers have detached and will continue/persist" \
+          >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "To manually cleanup later, run:" >> "$GITHUB_STEP_SUMMARY"
+        echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+
+        # Read instance metadata
+        if [ -f "$WORK_DIR/instances.json" ]; then
+          for slug in $(jq -r 'keys[]' "$WORK_DIR/instances.json"); do
+            cid=$(jq -r ".\"$slug\".cid" "$WORK_DIR/instances.json")
+            echo "docker kill $cid" >> "$GITHUB_STEP_SUMMARY"
+          done
+        fi
+
+        echo '```' >> "$GITHUB_STEP_SUMMARY"

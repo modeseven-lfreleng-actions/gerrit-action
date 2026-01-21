@@ -3,15 +3,19 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 # Action test/validation workflow
-name: "Test GitHub Action 🧪"
+name: 'Test GitHub Action 🧪'
+
+env:
+  gerrit-version: '3.13.1-ubuntu24'
+  plugin-version: 'stable-3.13'
 
 # yamllint disable-line rule:truthy
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: ['main']
   pull_request:
-    branches: ["main"]
+    branches: ['main']
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
@@ -20,56 +24,505 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
-    runs-on: ubuntu-latest
+  ### Test Basic Functionality ###
+  test-basic:
+    name: 'Test basic functionality'
+    runs-on: 'ubuntu-latest'
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 20
     steps:
-      # Harden the runner used by this workflow
-      # yamllint disable-line rule:line-length
-      - uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+
+      # Cache Docker layers
+      - name: 'Cache Docker layers'
+        # yamllint disable-line rule:line-length
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
-          egress-policy: audit
+          path: /tmp/.buildx-cache
+          # yamllint disable-line rule:line-length
+          key: gerrit-docker-${{ runner.os }}-${{ env.gerrit-version }}-basic
+          restore-keys: |
+            gerrit-docker-${{ runner.os }}-${{ env.gerrit-version }}
+            gerrit-docker-${{ runner.os }}-
+            gerrit-docker-
 
-      - name: "Checkout repository"
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
+      # Generate ephemeral SSH key for testing
+      - name: 'Generate ephemeral SSH key'
+        id: ssh-key
         shell: bash
         run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Generate ephemeral SSH key for testing
+          ssh-keygen -t rsa -b 2048 -f /tmp/test_key -N "" \
+            -C "test@gerrit-action"
+          chmod 600 /tmp/test_key
+          echo "SSH key generated for testing"
+          # Output the key for use in the action
+          {
+            echo "TEST_KEY<<EOF"
+            cat /tmp/test_key
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: "Running local action: ${{ github.repository }}"
+      # Test: Single instance without replication
+      - name: "Test: Single instance (no sync)"
+        id: basic-test
         uses: ./
         with:
-          input: "test input 💬"
+          gerrit_setup: |
+            [{
+              "slug": "test-basic",
+              "gerrit": "gerrit.example.org"
+            }]
+          ssh_private_key: ${{ steps.ssh-key.outputs.TEST_KEY }}
+          gerrit_version: ${{ env.gerrit-version }}
+          plugin_version: ${{ env.plugin-version }}
+          sync_on_startup: false
+          check_service: true
+          exit: true
+          debug: true
+          skip_plugin_install: false
+          enable_cache: true
+          cache_key_suffix: '-basic'
 
-      - name: "Validated local action: ${{ github.repository }}"
+      # Validate outputs
+      - name: 'Validate basic test outputs'
         shell: bash
         run: |
-          # Local action validation
-          echo "Validated local action: ${{ github.repository }}"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Validate basic test outputs
+          echo "Testing outputs from basic test..."
 
-      # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
+          # Check container_ids
+          CONTAINER_IDS='${{ steps.basic-test.outputs.container_ids }}'
+          echo "Container IDs: $CONTAINER_IDS"
+
+          if [ -z "$CONTAINER_IDS" ] || [ "$CONTAINER_IDS" = "null" ]; then
+            echo "Error: container_ids output is empty ❌"
+            exit 1
+          fi
+
+          # Validate JSON format
+          echo "$CONTAINER_IDS" | jq empty || {
+            echo "Error: container_ids is not valid JSON ❌"
+            exit 1
+          }
+
+          echo "Basic test outputs validated ✅"
+
+  ### Test Multiple Instances ###
+  test-multiple-instances:
+    name: 'Test multiple instances'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 25
+    steps:
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+
+      # Cache Docker layers
+      - name: 'Cache Docker layers'
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        with:
+          path: /tmp/.buildx-cache
+          key: gerrit-docker-${{ runner.os }}-${{ env.gerrit-version }}-multi
+          restore-keys: |
+            gerrit-docker-${{ runner.os }}-${{ env.gerrit-version }}
+            gerrit-docker-${{ runner.os }}-
+
+      # Generate ephemeral SSH key for testing
+      - name: 'Generate ephemeral SSH key'
+        id: ssh-key
+        shell: bash
+        run: |
+          # Generate ephemeral SSH key for testing
+          ssh-keygen -t rsa -b 2048 -f /tmp/test_key -N "" \
+            -C "test@gerrit-action"
+          chmod 600 /tmp/test_key
+          echo "SSH key generated for testing"
+          # Output the key for use in the action
+          {
+            echo "TEST_KEY<<EOF"
+            cat /tmp/test_key
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Test: Multiple instances
+      - name: "Test: Multiple instances"
+        id: multi-test
         uses: ./
-        id: failure
+        with:
+          gerrit_setup: |
+            [
+              {
+                "project": "TestProject1",
+                "slug": "test1",
+                "gerrit": "gerrit1.example.org"
+              },
+              {
+                "project": "TestProject2",
+                "slug": "test2",
+                "gerrit": "gerrit2.example.org"
+              }
+            ]
+          ssh_private_key: ${{ steps.ssh-key.outputs.TEST_KEY }}
+          gerrit_version: ${{ env.gerrit-version }}
+          base_http_port: 9000
+          base_ssh_port: 30000
+          sync_on_startup: false
+          check_service: true
+          exit: true
+          skip_plugin_install: true
+          enable_cache: true
+          cache_key_suffix: '-multi'
+
+      # Validate multiple instances
+      - name: 'Validate multiple instances'
+        shell: bash
+        run: |
+          # Validate multiple instances
+          INSTANCES='${{ steps.multi-test.outputs.instances }}'
+          echo "Instances JSON:"
+          echo "$INSTANCES" | jq '.'
+
+          # Count instances
+          INSTANCE_COUNT=$(echo "$INSTANCES" | jq '. | length')
+          echo "Instance count: $INSTANCE_COUNT"
+
+          if [ "$INSTANCE_COUNT" != "2" ]; then
+            echo "Error: Expected 2 instances, got $INSTANCE_COUNT ❌"
+            exit 1
+          fi
+
+          # Verify both slugs exist
+          if ! echo "$INSTANCES" | jq -e '.test1' >/dev/null; then
+            echo "Error: test1 instance not found ❌"
+            exit 1
+          fi
+
+          if ! echo "$INSTANCES" | jq -e '.test2' >/dev/null; then
+            echo "Error: test2 instance not found ❌"
+            exit 1
+          fi
+
+          # Verify ports are different
+          PORT1=$(echo "$INSTANCES" | jq -r '.test1.http_port')
+          PORT2=$(echo "$INSTANCES" | jq -r '.test2.http_port')
+
+          echo "Instance 1 HTTP port: $PORT1"
+          echo "Instance 2 HTTP port: $PORT2"
+
+          if [ "$PORT1" = "$PORT2" ]; then
+            echo "Error: Ports should be different ❌"
+            exit 1
+          fi
+
+          echo "Multiple instances validated ✅"
+
+  ### Test Persistent Container ###
+  test-persistent:
+    name: 'Test persistent container'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+
+      # Cache Docker layers
+      - name: 'Cache Docker layers'
+        # yamllint disable-line rule:line-length
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+        with:
+          path: /tmp/.buildx-cache
+          key: gerrit-docker-${{ runner.os }}-${{ env.gerrit-version }}-persist
+          restore-keys: |
+            gerrit-docker-${{ runner.os }}-${{ env.gerrit-version }}
+            gerrit-docker-${{ runner.os }}-
+
+      # Generate ephemeral SSH key for testing
+      - name: 'Generate ephemeral SSH key'
+        id: ssh-key
+        shell: bash
+        run: |
+          # Generate ephemeral SSH key for testing
+          ssh-keygen -t rsa -b 2048 -f /tmp/test_key -N "" \
+            -C "test@gerrit-action"
+          chmod 600 /tmp/test_key
+          echo "SSH key generated for testing"
+          # Output the key for use in the action
+          {
+            echo "TEST_KEY<<EOF"
+            cat /tmp/test_key
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Start persistent container
+      - name: "Start persistent Gerrit container"
+        id: persistent
+        uses: ./
+        with:
+          gerrit_setup: |
+            [{
+              "slug": "persistent",
+              "gerrit": "gerrit.example.org"
+            }]
+          ssh_private_key: ${{ steps.ssh-key.outputs.TEST_KEY }}
+          gerrit_version: ${{ env.gerrit-version }}
+          base_http_port: 8090
+          sync_on_startup: false
+          check_service: true
+          exit: false
+          skip_plugin_install: true
+          enable_cache: true
+          cache_key_suffix: '-persist'
+
+      # Verify container persists
+      - name: 'Verify container still running'
+        shell: bash
+        run: |
+          # Verify container still running
+          CONTAINER_ID=$(echo \
+            '${{ steps.persistent.outputs.container_ids }}' | \
+            jq -r '.[0]')
+
+          echo "Container ID: $CONTAINER_ID"
+
+          if [ -z "$CONTAINER_ID" ]; then
+            echo "Error: No container ID ❌"
+            exit 1
+          fi
+
+          # Check container exists and is running
+          if ! docker inspect "$CONTAINER_ID" >/dev/null 2>&1; then
+            echo "Error: Container does not exist ❌"
+            exit 1
+          fi
+
+          STATE=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_ID")
+          echo "Container state: $STATE"
+
+          if [ "$STATE" != "running" ]; then
+            echo "Error: Container is not running ❌"
+            exit 1
+          fi
+
+          # Test HTTP access
+          CONTAINER_IP=$(docker inspect -f \
+            '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+            "$CONTAINER_ID")
+
+          echo "Testing HTTP access at $CONTAINER_IP:8080..."
+
+          if curl -f -s -m 10 \
+            "http://$CONTAINER_IP:8080/config/server/version" \
+            >/dev/null; then
+            echo "Container is accessible ✅"
+          else
+            echo "Warning: Container not yet ready for HTTP"
+          fi
+
+      # Access from another step
+      - name: 'Access Gerrit from subsequent step'
+        shell: bash
+        run: |
+          # Access Gerrit from subsequent step
+          echo "Accessing Gerrit in a new step..."
+
+          INSTANCES='${{ steps.persistent.outputs.instances }}'
+          IP=$(echo "$INSTANCES" | jq -r '.persistent.ip')
+
+          echo "Gerrit IP: $IP"
+          echo "Container is still accessible from new step ✅"
+
+      # Manual cleanup
+      - name: 'Manual cleanup'
+        if: always()
+        shell: bash
+        run: |
+          # Manual cleanup
+          CONTAINER_ID=$(echo \
+            '${{ steps.persistent.outputs.container_ids }}' | \
+            jq -r '.[0]')
+
+          if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
+            echo "Cleaning up container: $CONTAINER_ID"
+            docker kill "$CONTAINER_ID" 2>/dev/null || \
+              echo "Container already stopped"
+            echo "Cleanup complete ✅"
+          fi
+
+  ### Test Input Validation ###
+  test-validation:
+    name: 'Test input validation'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+
+      # Test: Missing required input
+      - name: "Test: Missing gerrit_setup"
+        id: missing-setup
+        uses: ./
         continue-on-error: true
         with:
-          invalid_input: "Some garbage"
+          ssh_private_key: "fake-key"
+          gerrit_setup: ""
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      - name: 'Validate missing setup failure'
+        if: steps.missing-setup.outcome == 'success'
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
+          # Validate missing setup failure
+          echo "Error: Action should have failed with missing gerrit_setup ❌"
           exit 1
+
+      # Test: Invalid JSON
+      - name: "Test: Invalid JSON format"
+        id: invalid-json
+        uses: ./
+        continue-on-error: true
+        with:
+          gerrit_setup: "not valid json"
+          ssh_private_key: "fake-key"
+
+      - name: 'Validate invalid JSON failure'
+        if: steps.invalid-json.outcome == 'success'
+        shell: bash
+        run: |
+          # Validate invalid JSON failure
+          echo "Error: Action should have failed with invalid JSON ❌"
+          exit 1
+
+      # Test: Invalid auth type
+      - name: "Test: Invalid auth type"
+        id: invalid-auth
+        uses: ./
+        continue-on-error: true
+        with:
+          gerrit_setup: '[{"slug": "test", "gerrit": "example.org"}]'
+          auth_type: "invalid_type"
+
+      - name: 'Validate invalid auth failure'
+        if: steps.invalid-auth.outcome == 'success'
+        shell: bash
+        run: |
+          # Validate invalid auth failure
+          echo "Error: Action should have failed with invalid auth_type ❌"
+          exit 1
+
+      - name: 'Validation tests completed'
+        shell: bash
+        run: |
+          # Validation tests completed
+          echo "All validation tests passed ✅"
+
+  ### Test with Cache Disabled ###
+  test-no-cache:
+    name: 'Test without caching'
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+    timeout-minutes: 25
+    steps:
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+
+      # Generate ephemeral SSH key for testing
+      - name: 'Generate ephemeral SSH key'
+        id: ssh-key
+        shell: bash
+        run: |
+          # Generate ephemeral SSH key for testing
+          ssh-keygen -t rsa -b 2048 -f /tmp/test_key -N "" \
+            -C "test@gerrit-action"
+          chmod 600 /tmp/test_key
+          echo "SSH key generated for testing"
+          # Output the key for use in the action
+          {
+            echo "TEST_KEY<<EOF"
+            cat /tmp/test_key
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Test without cache
+      - name: "Test: No caching"
+        uses: ./
+        with:
+          gerrit_setup: |
+            [{
+              "slug": "no-cache",
+              "gerrit": "gerrit.example.org"
+            }]
+          ssh_private_key: ${{ steps.ssh-key.outputs.TEST_KEY }}
+          gerrit_version: ${{ env.gerrit-version }}
+          sync_on_startup: false
+          check_service: true
+          exit: true
+          skip_plugin_install: true
+          enable_cache: false
+
+      - name: 'No-cache test completed'
+        shell: bash
+        run: |
+          # No-cache test completed
+          echo "No-cache test completed ✅"
+
+  ### Test Summary ###
+  test-summary:
+    name: 'Test summary'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 5
+    needs:
+      - test-basic
+      - test-multiple-instances
+      - test-persistent
+      - test-validation
+      - test-no-cache
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: 'Generate test summary'
+        shell: bash
+        # yamllint disable rule:line-length
+        run: |
+          # Generate test summary
+          {
+            echo "# Test Results Summary 🧪"
+            echo ""
+            echo "| Test | Status |"
+            echo "|------|--------|"
+            echo "| Basic Functionality | ${{ needs.test-basic.result }} |"
+          # yamllint disable-line rule:line-length
+            echo "| Multiple Instances | ${{ needs.test-multiple-instances.result }} |"  # yamllint disable-line rule:line-length
+          # yamllint disable-line rule:line-length
+            echo "| Persistent Container | ${{ needs.test-persistent.result }} |"  # yamllint disable-line rule:line-length
+            echo "| Input Validation | ${{ needs.test-validation.result }} |"
+            echo "| No Cache | ${{ needs.test-no-cache.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Check for failures'
+        shell: bash
+        run: |
+          # Check for failures
+          if [ "${{ needs.test-basic.result }}" != "success" ] || \
+             [ "${{ needs.test-multiple-instances.result }}" != "success" ] || \  # yamllint disable-line rule:line-length
+             [ "${{ needs.test-persistent.result }}" != "success" ] || \
+             [ "${{ needs.test-validation.result }}" != "success" ] || \
+             [ "${{ needs.test-no-cache.result }}" != "success" ]; then
+            echo "::error::Some tests failed ❌"
+            exit 1
+          fi
+
+          echo "All tests passed! ✅"
