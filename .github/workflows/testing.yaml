@@ -34,7 +34,7 @@ jobs:
     steps:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.1  # yamllint disable-line rule:line-length
 
       # Cache Docker layers
       - name: 'Cache Docker layers'
@@ -121,7 +121,7 @@ jobs:
     steps:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.1  # yamllint disable-line rule:line-length
 
       # Cache Docker layers
       - name: 'Cache Docker layers'
@@ -232,7 +232,7 @@ jobs:
     steps:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.1  # yamllint disable-line rule:line-length
 
       # Cache Docker layers
       - name: 'Cache Docker layers'
@@ -367,7 +367,7 @@ jobs:
     steps:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.1  # yamllint disable-line rule:line-length
 
       # Test: Missing required input
       - name: "Test: Missing gerrit_setup"
@@ -436,7 +436,7 @@ jobs:
     steps:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1  # yamllint disable-line rule:line-length
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.1  # yamllint disable-line rule:line-length
 
       # Generate ephemeral SSH key for testing
       - name: 'Generate ephemeral SSH key'
