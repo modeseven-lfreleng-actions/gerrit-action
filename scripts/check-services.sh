@@ -11,6 +11,17 @@ set -euo pipefail
 echo "Checking Gerrit service availability..."
 echo ""
 
+# Function to check plugin status via container logs
+check_plugin_in_logs() {
+  local cid="$1"
+  local plugin_name="$2"
+
+  if docker logs "$cid" 2>&1 | grep -q "Loaded plugin $plugin_name"; then
+    return 0
+  fi
+  return 1
+}
+
 # Read instances metadata
 if [ ! -f "$WORK_DIR/instances.json" ]; then
   echo "::error::No instances metadata found ❌"
@@ -139,22 +150,40 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
     echo ""
     echo "Verifying pull-replication plugin..."
 
-    PLUGIN_CHECK=$(curl -s "http://$container_ip:8080/plugins/" \
-      2>/dev/null || echo "")
-
-    if echo "$PLUGIN_CHECK" | grep -q "pull-replication"; then
-      echo "Pull-replication plugin detected ✅"
+    # Method 1: Check container logs for plugin loading message
+    # This is the most reliable method as Gerrit logs plugin loading
+    if check_plugin_in_logs "$cid" "pull-replication"; then
+      echo "Pull-replication plugin loaded ✅ (verified via logs)"
     else
-      echo "::warning::Pull-replication plugin not found in plugin list"
+      # Method 2: Check via HTTP API (may not work for all auth configs)
+      PLUGIN_CHECK=$(curl -s "http://$container_ip:8080/plugins/" \
+        2>/dev/null || echo "")
 
-      # Check if plugin file exists in container
-      if docker exec "$cid" test -f \
-        /var/gerrit/plugins/pull-replication.jar; then
-        echo "  Plugin file exists but may not be loaded yet"
+      if echo "$PLUGIN_CHECK" | grep -q "pull-replication"; then
+        echo "Pull-replication plugin detected ✅"
       else
-        echo "  ::error::Plugin file not found in container"
-        CHECK_FAILED=1
+        # Method 3: Check if plugin file exists in container
+        if docker exec "$cid" test -f \
+          /var/gerrit/plugins/pull-replication.jar; then
+          echo "  Plugin file exists in container"
+          # Give it a moment and check logs again
+          sleep 3
+          if check_plugin_in_logs "$cid" "pull-replication"; then
+            echo "  Pull-replication plugin loaded ✅"
+          else
+            echo "::warning::Plugin file exists but not yet loaded"
+            echo "  This may be normal during initial startup"
+          fi
+        else
+          echo "::error::Plugin file not found in container"
+          CHECK_FAILED=1
+        fi
       fi
+    fi
+
+    # Also verify replication-api is loaded (dependency)
+    if check_plugin_in_logs "$cid" "replication-api"; then
+      echo "Replication-api plugin loaded ✅"
     fi
   fi
 

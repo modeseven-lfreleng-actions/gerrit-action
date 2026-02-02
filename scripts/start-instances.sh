@@ -92,6 +92,20 @@ generate_replication_config() {
   # Get API URL for this instance (detected by detect-api-paths.sh)
   local api_url
   api_url=$(get_api_url "$slug")
+  local api_path
+  api_path=$(get_api_path "$slug")
+
+  # Build the authenticated git-over-https URL
+  # For HTTP Basic auth, Gerrit uses /a/ prefix for authenticated access
+  # URL format: https://<host>/<api_path>/a/${name}.git
+  local git_url
+  if [ -n "$api_path" ]; then
+    # Remove leading slash from api_path if present for consistent URL building
+    api_path="${api_path#/}"
+    git_url="https://${gerrit_host}/${api_path}/a/\${name}.git"
+  else
+    git_url="https://${gerrit_host}/a/\${name}.git"
+  fi
 
   # Parse sync_refs from environment
   IFS=',' read -ra REFS <<< "$SYNC_REFS"
@@ -111,7 +125,7 @@ generate_replication_config() {
   refsBatchSize = 50
 
 [remote "$slug"]
-  url = git://${gerrit_host}/\${name}.git
+  url = ${git_url}
   timeout = $REPLICATION_TIMEOUT
   replicationDelay = 0
   replicationRetry = 60
@@ -120,10 +134,12 @@ generate_replication_config() {
   replicateHiddenProjects = false
 EOF
 
+  echo "  Git URL for replication: $git_url" >&2
+
   # Add apiUrl if detected/provided
   if [ -n "$api_url" ]; then
     echo "  apiUrl = $api_url" >> "$config_file"
-    echo "  Added apiUrl to replication config: $api_url" >&2
+    echo "  API URL for notifications: $api_url" >&2
   fi
 
   # Add fetch refspecs
