@@ -17,6 +17,7 @@ if [ ! -f "$WORK_DIR/instances.json" ]; then
 fi
 
 INSTANCES_JSON_FILE="$WORK_DIR/instances.json"
+API_PATHS_FILE="$WORK_DIR/api_paths.json"
 
 # Build container IDs array
 CONTAINER_IDS_JSON="["
@@ -62,6 +63,46 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   fi
 done
 
+# Build API paths JSON (mapping slug to api_path and api_url)
+if [ -f "$API_PATHS_FILE" ]; then
+  API_PATHS_JSON=$(cat "$API_PATHS_FILE")
+else
+  # Build from instances.json if api_paths.json doesn't exist
+  API_PATHS_JSON="{}"
+  for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
+    api_path=$(jq -r ".\"$slug\".api_path // \"\"" "$INSTANCES_JSON_FILE")
+    api_url=$(jq -r ".\"$slug\".api_url // \"\"" "$INSTANCES_JSON_FILE")
+    gerrit_host=$(jq -r ".\"$slug\".gerrit_host // \"\"" "$INSTANCES_JSON_FILE")
+
+    temp_json=$(mktemp)
+    echo "$API_PATHS_JSON" | jq \
+      --arg slug "$slug" \
+      --arg api_path "$api_path" \
+      --arg api_url "$api_url" \
+      --arg gerrit_host "$gerrit_host" \
+      '.[$slug] = {
+        gerrit_host: $gerrit_host,
+        api_path: $api_path,
+        api_url: $api_url
+      }' > "$temp_json"
+    API_PATHS_JSON=$(cat "$temp_json")
+    rm -f "$temp_json"
+  done
+fi
+
+# Build SSH host keys JSON (mapping slug to host public keys)
+SSH_HOST_KEYS_JSON="{}"
+for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
+  ssh_keys=$(jq -c ".\"$slug\".ssh_host_keys // {}" "$INSTANCES_JSON_FILE")
+  temp_json=$(mktemp)
+  echo "$SSH_HOST_KEYS_JSON" | jq \
+    --arg slug "$slug" \
+    --argjson keys "$ssh_keys" \
+    '.[$slug] = $keys' > "$temp_json"
+  SSH_HOST_KEYS_JSON=$(cat "$temp_json")
+  rm -f "$temp_json"
+done
+
 # Read full instances JSON
 INSTANCES_JSON=$(cat "$INSTANCES_JSON_FILE")
 
@@ -73,6 +114,12 @@ INSTANCES_JSON=$(cat "$INSTANCES_JSON_FILE")
   echo "instances<<EOF"
   echo "$INSTANCES_JSON"
   echo "EOF"
+  echo "api_paths<<EOF"
+  echo "$API_PATHS_JSON"
+  echo "EOF"
+  echo "ssh_host_keys<<EOF"
+  echo "$SSH_HOST_KEYS_JSON"
+  echo "EOF"
 } >> "$GITHUB_OUTPUT"
 
 # Display summary
@@ -81,6 +128,8 @@ echo ""
 echo "Container IDs: $CONTAINER_IDS_JSON"
 echo "Container IPs: $CONTAINER_IPS_JSON"
 echo "Gerrit URLs: $GERRIT_URLS"
+echo "API Paths: $API_PATHS_JSON"
+echo "SSH Host Keys: $SSH_HOST_KEYS_JSON"
 echo ""
 
 # Add to step summary
@@ -91,6 +140,18 @@ echo ""
   echo "$INSTANCES_JSON" | jq '.'
   echo '```'
   echo ""
+  echo "**API Paths** 🔗"
+  echo ""
+  echo '```json'
+  echo "$API_PATHS_JSON" | jq '.'
+  echo '```'
+  echo ""
+  echo "**SSH Host Keys** 🔑"
+  echo ""
+  echo '```json'
+  echo "$SSH_HOST_KEYS_JSON" | jq '.'
+  echo '```'
+  echo ""
   echo "**Access URLs** 🔗"
   echo ""
 } >> "$GITHUB_STEP_SUMMARY"
@@ -98,11 +159,13 @@ echo ""
 for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   http_port=$(jq -r ".\"$slug\".http_port" "$INSTANCES_JSON_FILE")
   ssh_port=$(jq -r ".\"$slug\".ssh_port" "$INSTANCES_JSON_FILE")
+  api_url=$(jq -r ".\"$slug\".api_url // \"N/A\"" "$INSTANCES_JSON_FILE")
 
   {
     echo "- **$slug**"
     echo "  - HTTP: \`http://localhost:$http_port\`"
     echo "  - SSH: \`ssh://localhost:$ssh_port\`"
+    echo "  - Source API: \`$api_url\`"
   } >> "$GITHUB_STEP_SUMMARY"
 done
 

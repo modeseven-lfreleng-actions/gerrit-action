@@ -10,6 +10,29 @@ set -euo pipefail
 
 echo "Starting Gerrit instances..."
 
+# API paths file (populated by detect-api-paths.sh)
+API_PATHS_FILE="$WORK_DIR/api_paths.json"
+
+# Function to get API path for a slug
+get_api_path() {
+  local slug="$1"
+  if [ -f "$API_PATHS_FILE" ]; then
+    jq -r ".\"$slug\".api_path // \"\"" "$API_PATHS_FILE"
+  else
+    echo ""
+  fi
+}
+
+# Function to get API URL for a slug
+get_api_url() {
+  local slug="$1"
+  if [ -f "$API_PATHS_FILE" ]; then
+    jq -r ".\"$slug\".api_url // \"\"" "$API_PATHS_FILE"
+  else
+    echo ""
+  fi
+}
+
 # Parse configuration
 INSTANCES=$(echo "$GERRIT_SETUP" | jq -c '.[]')
 INSTANCE_INDEX=0
@@ -59,12 +82,16 @@ EOF
   chmod 600 "$instance_dir/ssh/config"
 }
 
-# Generate replication.config
+# Generate replication.config (used by both replication and pull-replication plugins)
 generate_replication_config() {
   local config_file="$1"
   local slug="$2"
   local gerrit_host="$3"
   local project="${4:-}"
+
+  # Get API URL for this instance (detected by detect-api-paths.sh)
+  local api_url
+  api_url=$(get_api_url "$slug")
 
   # Parse sync_refs from environment
   IFS=',' read -ra REFS <<< "$SYNC_REFS"
@@ -92,6 +119,12 @@ generate_replication_config() {
   createMissingRepositories = true
   replicateHiddenProjects = false
 EOF
+
+  # Add apiUrl if detected/provided
+  if [ -n "$api_url" ]; then
+    echo "  apiUrl = $api_url" >> "$config_file"
+    echo "  Added apiUrl to replication config: $api_url" >&2
+  fi
 
   # Add fetch refspecs
   for ref in "${REFS[@]}"; do
@@ -300,9 +333,15 @@ start_instance() {
   fi
 
   # Generate replication configuration
+  # Note: pull-replication plugin uses replication.config (same as bundled plugin)
+  # We remove the bundled replication.jar to avoid conflicts
   generate_replication_config "$instance_dir/etc/replication.config" \
     "$slug" "$gerrit_host" "$project"
   generate_secure_config "$instance_dir/etc/secure.config" "$slug"
+
+  # Remove the bundled replication plugin to avoid conflicts
+  # The pull-replication plugin will be used instead
+  rm -f "$instance_dir/plugins/replication.jar" 2>/dev/null || true
 
   # Start container
   echo "Starting Gerrit container..."
@@ -357,6 +396,46 @@ start_instance() {
 
   echo "$cid" >> "$CONTAINER_IDS_FILE"
 
+  # Get API path and URL for this instance
+  local api_path
+  local api_url
+  api_path=$(get_api_path "$slug")
+  api_url=$(get_api_url "$slug")
+
+  # Capture SSH host keys from the container
+  # These are auto-generated during Gerrit init
+  local ssh_host_keys_dir="$WORK_DIR/ssh_host_keys/$slug"
+  mkdir -p "$ssh_host_keys_dir"
+
+  echo "Capturing SSH host keys..."
+  # Copy all host key files from the container
+  for key_type in rsa ed25519 ecdsa_256 ecdsa_384 ecdsa_521; do
+    local key_file="ssh_host_${key_type}_key"
+    if docker exec "$cid" test -f "/var/gerrit/etc/${key_file}"; then
+      docker cp "$cid:/var/gerrit/etc/${key_file}" \
+        "$ssh_host_keys_dir/${key_file}" 2>/dev/null || true
+      docker cp "$cid:/var/gerrit/etc/${key_file}.pub" \
+        "$ssh_host_keys_dir/${key_file}.pub" 2>/dev/null || true
+    fi
+  done
+
+  # Build SSH host public keys JSON for this instance
+  local ssh_host_pub_keys=""
+  for pub_key_file in "$ssh_host_keys_dir"/*.pub; do
+    if [ -f "$pub_key_file" ]; then
+      local key_name
+      key_name=$(basename "$pub_key_file" .pub)
+      local key_content
+      key_content=$(cat "$pub_key_file" | tr -d '\n')
+      if [ -n "$ssh_host_pub_keys" ]; then
+        ssh_host_pub_keys="${ssh_host_pub_keys},"
+      fi
+      ssh_host_pub_keys="${ssh_host_pub_keys}\"${key_name}\":\"${key_content}\""
+    fi
+  done
+  ssh_host_pub_keys="{${ssh_host_pub_keys}}"
+  echo "  SSH host keys captured ✅"
+
   # Store instance metadata
   local temp_json
   temp_json=$(mktemp)
@@ -368,6 +447,9 @@ start_instance() {
      --arg url "http://$container_ip:8080" \
      --arg gerrit_host "$gerrit_host" \
      --arg project "$project" \
+     --arg api_path "$api_path" \
+     --arg api_url "$api_url" \
+     --argjson ssh_host_keys "$ssh_host_pub_keys" \
      '.[$slug] = {
        cid: $cid,
        ip: $ip,
@@ -375,7 +457,10 @@ start_instance() {
        ssh_port: $ssh_port,
        url: $url,
        gerrit_host: $gerrit_host,
-       project: $project
+       project: $project,
+       api_path: $api_path,
+       api_url: $api_url,
+       ssh_host_keys: $ssh_host_keys
      }' \
      "$INSTANCES_JSON_FILE" > "$temp_json"
   mv "$temp_json" "$INSTANCES_JSON_FILE"
@@ -385,6 +470,7 @@ start_instance() {
   echo "   IP Address: $container_ip"
   echo "   HTTP URL: http://$container_ip:8080"
   echo "   SSH URL: ssh://localhost:$ssh_port"
+  echo "   Source API URL: $api_url"
   echo ""
 
   # Log container status
