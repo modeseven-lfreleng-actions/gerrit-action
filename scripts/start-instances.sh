@@ -82,6 +82,62 @@ EOF
   chmod 600 "$instance_dir/ssh/config"
 }
 
+# Fetch project list from remote Gerrit server
+# This is needed for replicateOnStartup because FetchAll iterates over
+# projectCache.all() - projects must exist locally before they can be replicated
+fetch_remote_projects() {
+  local gerrit_host="$1"
+  local api_path="${2:-}"
+  local project_filter="${3:-}"
+  local max_projects="${4:-100}"  # Limit for safety
+
+  echo "Fetching project list from $gerrit_host..." >&2
+
+  # Build API URL
+  local api_url
+  if [ -n "$api_path" ]; then
+    api_path="${api_path#/}"  # Remove leading slash
+    api_url="https://${gerrit_host}/${api_path}/projects/"
+  else
+    api_url="https://${gerrit_host}/projects/"
+  fi
+
+  # Add query parameters
+  local query_params="n=${max_projects}"
+  if [ -n "$project_filter" ] && [ "$project_filter" != ".*" ]; then
+    # Use regex filter if it looks like a pattern, otherwise prefix match
+    if [[ "$project_filter" == *"*"* ]] || [[ "$project_filter" == *"."* ]]; then
+      query_params="${query_params}&r=$(printf '%s' "$project_filter" | jq -sRr @uri)"
+    else
+      query_params="${query_params}&p=$(printf '%s' "$project_filter" | jq -sRr @uri)"
+    fi
+  fi
+
+  local full_url="${api_url}?${query_params}"
+  echo "  API URL: $full_url" >&2
+
+  # Fetch projects (Gerrit API returns )]}' prefix for XSSI protection)
+  local response
+  response=$(curl -s --connect-timeout 30 --max-time 60 "$full_url" 2>/dev/null) || {
+    echo "  Warning: Failed to fetch project list from $gerrit_host" >&2
+    return 1
+  }
+
+  # Remove XSSI protection prefix and parse JSON
+  local projects
+  projects=$(echo "$response" | tail -n +2 | jq -r 'keys[]' 2>/dev/null) || {
+    echo "  Warning: Failed to parse project list response" >&2
+    return 1
+  }
+
+  local count
+  count=$(echo "$projects" | grep -c . || echo "0")
+  echo "  Found $count projects on remote server" >&2
+
+  # Return project list (one per line)
+  echo "$projects"
+}
+
 # Generate replication.config (used by both replication and pull-replication plugins)
 generate_replication_config() {
   local config_file="$1"
@@ -127,6 +183,7 @@ generate_replication_config() {
 [remote "$slug"]
   url = ${git_url}
   timeout = $REPLICATION_TIMEOUT
+  connectionTimeout = 120000
   replicationDelay = 0
   replicationRetry = 60
   threads = $REPLICATION_THREADS
@@ -301,7 +358,96 @@ configure_gerrit() {
   # Enable replication plugin
   git config -f "$config_file" plugin.pull-replication.enabled "true"
 
+  # Enable replica mode - REQUIRED for replicateOnStartup to work!
+  # The pull-replication plugin's OnStartStop.start() checks:
+  #   if (isReplica && srvInfo.getState() == STARTUP && config.isReplicateAllOnPluginStart())
+  # Without replica mode, the FetchAll is never scheduled.
+  git config -f "$config_file" container.replica "true"
+
   echo "Gerrit configured ✅"
+}
+
+# Create empty project directories for replication
+# CRITICAL: The pull-replication plugin's FetchAll iterates over projectCache.all()
+# which only includes projects that exist locally. Without creating these repos
+# first, replicateOnStartup will have nothing to replicate!
+create_project_directories() {
+  local instance_dir="$1"
+  local project="$2"
+  local gerrit_host="$3"
+  local slug="$4"
+
+  echo "Creating project directories for replication..."
+  echo "(Required: FetchAll iterates over projectCache.all())"
+
+  local projects_to_create=()
+
+  if [ -z "$project" ]; then
+    # No specific project filter - fetch ALL projects from remote server
+    echo "No project filter specified, fetching project list from remote..."
+
+    # Get API path for this instance
+    local api_path
+    api_path=$(get_api_path "$slug")
+
+    # Fetch remote projects
+    local remote_projects
+    if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "" 500); then
+      # Convert newline-separated list to array
+      while IFS= read -r proj; do
+        [ -n "$proj" ] && projects_to_create+=("$proj")
+      done <<< "$remote_projects"
+    else
+      echo "  Warning: Could not fetch remote project list"
+      echo "  Replication will only work for manually created repos"
+      return 0
+    fi
+  else
+    # Handle comma-separated project list or single project/pattern
+    # Check if it's a regex pattern (contains special chars)
+    if [[ "$project" == *"*"* ]] || [[ "$project" == *"["* ]] || \
+       [[ "$project" == "^"* ]] || [[ "$project" == ".*" ]]; then
+      echo "  Project filter appears to be a regex: $project"
+      echo "  Fetching matching projects from remote..."
+
+      local api_path
+      api_path=$(get_api_path "$slug")
+
+      local remote_projects
+      if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "$project" 500); then
+        while IFS= read -r proj; do
+          [ -n "$proj" ] && projects_to_create+=("$proj")
+        done <<< "$remote_projects"
+      else
+        echo "  Warning: Could not fetch filtered project list"
+        return 0
+      fi
+    else
+      # Literal project name(s) - could be comma-separated
+      IFS=',' read -ra PROJECTS <<< "$project"
+      for proj in "${PROJECTS[@]}"; do
+        proj=$(echo "$proj" | xargs)  # trim whitespace
+        [ -n "$proj" ] && projects_to_create+=("$proj")
+      done
+    fi
+  fi
+
+  # Create directories for all projects
+  local created_count=0
+  for proj in "${projects_to_create[@]}"; do
+    local project_dir="$instance_dir/git/${proj}.git"
+    echo "  Creating: ${proj}.git"
+    mkdir -p "$project_dir"
+    git init --bare "$project_dir" 2>/dev/null || true
+    chmod -R 777 "$project_dir"
+    ((created_count++))
+  done
+
+  echo "Project directories created: $created_count ✅"
+
+  # Store expected project count for later verification
+  # This file will be read when building instances.json
+  echo "$created_count" > "$instance_dir/expected_project_count"
 }
 
 # Start single instance
@@ -354,6 +500,10 @@ start_instance() {
   generate_replication_config "$instance_dir/etc/replication.config" \
     "$slug" "$gerrit_host" "$project"
   generate_secure_config "$instance_dir/etc/secure.config" "$slug"
+
+  # Create project directories for replication
+  # Pass gerrit_host and slug so we can fetch remote project list if needed
+  create_project_directories "$instance_dir" "$project" "$gerrit_host" "$slug"
 
   # Remove the bundled replication plugin to avoid conflicts
   # The pull-replication plugin will be used instead
@@ -442,7 +592,7 @@ start_instance() {
       local key_name
       key_name=$(basename "$pub_key_file" .pub)
       local key_content
-      key_content=$(cat "$pub_key_file" | tr -d '\n')
+      key_content=$(tr -d '\n' < "$pub_key_file")
       if [ -n "$ssh_host_pub_keys" ]; then
         ssh_host_pub_keys="${ssh_host_pub_keys},"
       fi
@@ -451,6 +601,12 @@ start_instance() {
   done
   ssh_host_pub_keys="{${ssh_host_pub_keys}}"
   echo "  SSH host keys captured ✅"
+
+  # Read expected project count from earlier step
+  local expected_project_count=0
+  if [ -f "$instance_dir/expected_project_count" ]; then
+    expected_project_count=$(cat "$instance_dir/expected_project_count" 2>/dev/null || echo "0")
+  fi
 
   # Store instance metadata
   local temp_json
@@ -465,6 +621,7 @@ start_instance() {
      --arg project "$project" \
      --arg api_path "$api_path" \
      --arg api_url "$api_url" \
+     --argjson expected_project_count "$expected_project_count" \
      --argjson ssh_host_keys "$ssh_host_pub_keys" \
      '.[$slug] = {
        cid: $cid,
@@ -476,6 +633,7 @@ start_instance() {
        project: $project,
        api_path: $api_path,
        api_url: $api_url,
+       expected_project_count: $expected_project_count,
        ssh_host_keys: $ssh_host_keys
      }' \
      "$INSTANCES_JSON_FILE" > "$temp_json"

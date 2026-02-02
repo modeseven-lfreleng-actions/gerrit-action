@@ -13,7 +13,18 @@ inputs:
   gerrit_setup:
     description: |
       JSON array defining Gerrit instances to start.
-      Format: [{"project": "ONAP", "slug": "onap", "gerrit": "gerrit.onap.org"}]
+      Format: [{"slug": "onap", "gerrit": "gerrit.onap.org", "project": "", "api_path": "/r"}]
+
+      Fields:
+        - slug (required): Short identifier for the instance
+        - gerrit (required): Gerrit server hostname
+        - project (optional): Project filter for replication
+            - Empty string or omitted: Replicate ALL projects from server
+            - Literal name: "releng/lftools" - single project
+            - Comma-separated: "releng/lftools,ci-management" - multiple projects
+            - Regex pattern: "releng/.*" or "^infra/.*" - pattern matching
+        - api_path (optional): API path prefix (e.g., "/infra", "/r", "/gerrit")
+
       Can be overridden by repository variable GERRIT_SETUP
     required: true
 
@@ -94,7 +105,7 @@ inputs:
       before checking for replicated repositories. Only used when
       sync_on_startup is true.
     required: false
-    default: '120'
+    default: '300'
 
   # Optional - Container Management
   exit:

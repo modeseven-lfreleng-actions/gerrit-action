@@ -181,25 +181,45 @@ The `gerrit_setup` input accepts a JSON array of instance configurations:
 ```json
 [
   {
-    "project": "ONAP",
     "slug": "onap",
-    "gerrit": "gerrit.onap.org"
+    "gerrit": "gerrit.onap.org",
+    "project": "",
+    "api_path": "/r"
   },
   {
-    "project": "OpenDaylight",
     "slug": "opendaylight",
-    "gerrit": "git.opendaylight.org"
+    "gerrit": "git.opendaylight.org",
+    "project": "releng/.*",
+    "api_path": "/gerrit"
   }
 ]
 ```
 
 ### Configuration Fields
 
-- **`project`** (optional) - Project name/filter for replication
 - **`slug`** (required) - Unique identifier for this instance (used in
-  container naming)
+  container naming and credential lookup)
 - **`gerrit`** (required) - Hostname of the source Gerrit server to
   replicate from
+- **`project`** (optional) - Project filter for replication:
+  - **Empty string** (`""`) or omitted: Replicate **all projects** from the server
+  - **Literal name**: `"releng/lftools"` - single project
+  - **Comma-separated**: `"releng/lftools,ci-management"` - multiple projects
+  - **Regex pattern**: `"releng/.*"` or `"^infra/.*"` - pattern matching
+- **`api_path`** (optional) - API path prefix if Gerrit is not at the root
+  (e.g., `/infra`, `/r`, `/gerrit`). Auto-detected if not provided.
+
+### Project Filter Behavior
+
+When the `project` field is empty or omitted, the action will:
+
+1. Query the remote Gerrit server's `/projects/` API endpoint
+2. Fetch the list of all available projects
+3. Pre-create empty bare repositories for each project locally
+4. Configure pull-replication to sync all projects on startup
+
+This enables full server mirroring without needing to specify individual
+project names.
 
 ## Usage Examples
 

@@ -58,3 +58,6 @@ MANIFEST
 
 # Node
 node_modules/*
+
+# Local testing
+.env
