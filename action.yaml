@@ -126,11 +126,25 @@ outputs:
   instances:
     description: |
       JSON object mapping slug to instance details
-      {cid, ip, http_port, ssh_port, url}
+      {cid, ip, http_port, ssh_port, url, api_path, api_url}
     value: ${{ steps.collect-outputs.outputs.instances }}
   gerrit_urls:
     description: "Comma-separated list of Gerrit HTTP URLs"
     value: ${{ steps.collect-outputs.outputs.gerrit_urls }}
+  api_paths:
+    description: |
+      JSON object mapping slug to API path details
+      {gerrit_host, api_path, api_url} for each instance.
+      The api_path is the URL prefix (e.g., /r, /infra, /gerrit)
+      detected or provided for each Gerrit server.
+    value: ${{ steps.collect-outputs.outputs.api_paths }}
+  ssh_host_keys:
+    description: |
+      JSON object mapping slug to SSH host public keys.
+      Contains the auto-generated SSH host keys for each Gerrit instance,
+      which can be used by downstream steps for automation tasks.
+      Format: {slug: {ssh_host_rsa_key: "...", ssh_host_ed25519_key: "...", ...}}
+    value: ${{ steps.collect-outputs.outputs.ssh_host_keys }}
 
 runs:
   using: "composite"
@@ -263,6 +277,19 @@ runs:
         docker pull gerritcodereview/gerrit:${{ inputs.gerrit_version }} || {
           echo "Warning: Failed to pre-pull image, will attempt during run"
         }
+
+    # Detect Gerrit API paths
+    - name: 'Detect Gerrit API paths'
+      id: detect-api-paths
+      shell: bash
+      env:
+        GERRIT_SETUP: ${{ inputs.gerrit_setup }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Detect Gerrit API paths via redirect detection
+        set -euo pipefail
+
+        source "${{ github.action_path }}/scripts/detect-api-paths.sh"
 
     # Start Gerrit instances
     - name: 'Start Gerrit instances'
