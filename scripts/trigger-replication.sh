@@ -10,6 +10,17 @@ set -euo pipefail
 echo "Triggering initial replication..."
 echo ""
 
+# Function to check plugin status via container logs
+check_plugin_in_logs() {
+  local cid="$1"
+  local plugin_name="$2"
+
+  if docker logs "$cid" 2>&1 | grep -q "Loaded plugin $plugin_name"; then
+    return 0
+  fi
+  return 1
+}
+
 # Read instances metadata
 if [ ! -f "$WORK_DIR/instances.json" ]; then
   echo "::error::No instances metadata found ❌"
@@ -45,27 +56,45 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
     continue
   fi
 
-  # Check if pull-replication plugin is loaded
+  # Check if pull-replication plugin is loaded via container logs
   if [ "$SKIP_PLUGIN_INSTALL" != "true" ]; then
     echo "Verifying pull-replication plugin is loaded..."
 
-    PLUGIN_STATUS=$(docker exec "$cid" sh -c \
-      "gerrit plugin ls 2>/dev/null || echo 'command_not_found'" \
-      || echo "error")
-
-    if echo "$PLUGIN_STATUS" | grep -q "pull-replication"; then
+    if check_plugin_in_logs "$cid" "pull-replication"; then
       echo "Pull-replication plugin is active ✅"
-    elif echo "$PLUGIN_STATUS" | grep -q "command_not_found"; then
-      echo "::warning::Cannot verify plugin status"
-      echo "::warning::(gerrit command not available)"
+
+      # Show the plugin version from logs
+      PLUGIN_VERSION_LOG=$(docker logs "$cid" 2>&1 | \
+        grep "Loaded plugin pull-replication" | tail -1 || echo "")
+      if [ -n "$PLUGIN_VERSION_LOG" ]; then
+        echo "  $PLUGIN_VERSION_LOG"
+      fi
     else
-      echo "::warning::Pull-replication plugin not detected"
-      echo "Plugin status output:"
-      echo "$PLUGIN_STATUS"
-      REPLICATION_FAILED=$((REPLICATION_FAILED + 1))
+      echo "::warning::Pull-replication plugin not detected in logs"
+
+      # Fallback: check if plugin file exists
+      if docker exec "$cid" test -f \
+        /var/gerrit/plugins/pull-replication.jar; then
+        echo "  Plugin file exists, may still be loading..."
+      else
+        echo "::warning::Plugin file not found in container"
+        REPLICATION_FAILED=$((REPLICATION_FAILED + 1))
+      fi
     fi
     echo ""
   fi
+
+  # Show replication configuration for debugging
+  echo "Replication configuration:"
+  if docker exec "$cid" test -f /var/gerrit/etc/replication.config; then
+    echo "--- replication.config ---"
+    docker exec "$cid" cat /var/gerrit/etc/replication.config 2>/dev/null | \
+      grep -v "^#" | grep -v "^$" || true
+    echo "---"
+  else
+    echo "::warning::replication.config not found"
+  fi
+  echo ""
 
   # Trigger replication via SSH (if available)
   if [ "$AUTH_TYPE" = "ssh" ]; then
@@ -164,7 +193,7 @@ else
 
   # Add to step summary
   {
-    echo "**Replication Status** ⚠️"
+    echo "**Replication Trigger Status** ⚠️"
     echo ""
     echo "Some replication triggers encountered issues."
     echo "Check logs for details."
@@ -172,6 +201,7 @@ else
   } >> "$GITHUB_STEP_SUMMARY"
 fi
 
+# Always add monitoring instructions to step summary
 {
   echo "To monitor ongoing replication, check container logs:"
   echo '```bash'
@@ -186,3 +216,7 @@ done
   echo '```'
   echo ""
 } >> "$GITHUB_STEP_SUMMARY"
+
+# Note: Actual failure decision is delegated to verify-replication.sh
+# which runs after this script when require_replication_success is true.
+# This script only triggers replication; verification is separate.

@@ -81,6 +81,20 @@ inputs:
     description: "Number of replication threads per instance"
     required: false
     default: '4'
+  require_replication_success:
+    description: |
+      If true and sync_on_startup is true, the workflow will fail
+      if replication verification fails. Set to false to allow
+      the workflow to succeed even if replication issues are detected.
+    required: false
+    default: 'true'
+  replication_wait_timeout:
+    description: |
+      Maximum time (in seconds) to wait for replication to complete
+      before checking for replicated repositories. Only used when
+      sync_on_startup is true.
+    required: false
+    default: '120'
 
   # Optional - Container Management
   exit:
@@ -341,11 +355,26 @@ runs:
         SKIP_PLUGIN_INSTALL: ${{ inputs.skip_plugin_install }}
         AUTH_TYPE: ${{ inputs.auth_type }}
         SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
+        REQUIRE_REPLICATION_SUCCESS: ${{ inputs.require_replication_success }}
+        REPLICATION_WAIT_TIMEOUT: ${{ inputs.replication_wait_timeout }}
       run: |
         # Trigger initial replication
         set -euo pipefail
 
         source "${{ github.action_path }}/scripts/trigger-replication.sh"
+
+    # Verify replication success
+    - name: "Verify replication success"
+      if: inputs.sync_on_startup == 'true' && inputs.require_replication_success == 'true'
+      shell: bash
+      env:
+        REPLICATION_WAIT_TIMEOUT: ${{ inputs.replication_wait_timeout }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Verify replication success
+        set -euo pipefail
+
+        source "${{ github.action_path }}/scripts/verify-replication.sh"
 
     # Collect outputs
     - name: "Collect outputs"
