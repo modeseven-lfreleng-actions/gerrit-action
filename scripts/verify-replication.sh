@@ -5,6 +5,10 @@
 # Verify Gerrit replication success
 # This script waits for and validates that replication has completed
 # successfully for all configured instances
+#
+# Key insight: The pull-replication plugin logs activity to:
+#   /var/gerrit/logs/pull_replication_log
+# This is the primary source for verifying replication success.
 
 set -euo pipefail
 
@@ -25,38 +29,239 @@ VERIFICATION_FAILED=0
 TOTAL_INSTANCES=0
 
 # Function to check if pull-replication plugin is loaded
+# Uses multiple methods to ensure reliable detection:
+# 1. Check recent logs (last 1000 lines) for plugin load message
+# 2. Check full logs with timeout protection
+# 3. Fallback: check if plugin jar file exists in container
 check_plugin_loaded() {
   local cid="$1"
 
-  if docker logs "$cid" 2>&1 | grep -q "Loaded plugin pull-replication"; then
+  # Method 1: Check recent logs (most reliable, avoids buffer issues)
+  # Use grep without -q and redirect stdout to /dev/null to avoid broken pipe errors
+  if docker logs --tail 1000 "$cid" 2>&1 | grep "Loaded plugin pull-replication" >/dev/null 2>&1; then
     return 0
   fi
+
+  # Method 2: Check full logs with timeout to avoid hanging on large log output
+  # Use head to limit output and prevent pipe buffer issues
+  if timeout 10 docker logs "$cid" 2>&1 | head -n 5000 | grep "Loaded plugin pull-replication" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Method 3: Fallback - check if plugin file exists AND check pull_replication_log exists
+  # If the log file exists, the plugin must have been loaded
+  if docker exec "$cid" test -f /var/gerrit/plugins/pull-replication.jar 2>/dev/null; then
+    if docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
+      return 0
+    fi
+  fi
+
   return 1
 }
 
-# Function to check for replication errors in logs
+# Function to check for replication errors in pull_replication_log
+# This is the PRIMARY source for replication errors
 check_replication_errors() {
   local cid="$1"
 
-  # Look for common replication error patterns
+  # First check pull_replication_log - this is the definitive source
+  if docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
+    local repl_log
+    repl_log=$(docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "")
+
+    if [ -n "$repl_log" ]; then
+      # Check for explicit failure patterns in pull_replication_log
+      # Use grep without -q and redirect output to avoid broken pipe errors
+      if printf '%s\n' "$repl_log" 2>/dev/null | grep -iE "Cannot replicate|TransportException|git-upload-pack not permitted|Authentication.*failed|Permission denied|Connection refused|error|failed|Exception" >/dev/null 2>&1; then
+        return 0  # Found errors
+      fi
+    fi
+  fi
+
+  # Also check container logs for additional error patterns
+  # Use --tail to limit output and avoid pipe buffer issues with large logs
   local error_patterns=(
-    "pull-replication.*error"
-    "pull-replication.*failed"
-    "replication.*Exception"
     "Cannot replicate"
-    "Replication.*failed"
+    "TransportException"
+    "git-upload-pack not permitted"
     "Authentication.*failed"
     "Permission denied"
     "Connection refused"
+    "replication.*error"
+    "replication.*failed"
   )
 
+  # Get recent logs once to avoid multiple docker logs calls
+  local recent_logs
+  recent_logs=$(docker logs --tail 2000 "$cid" 2>&1 || echo "")
+
   for pattern in "${error_patterns[@]}"; do
-    if docker logs "$cid" 2>&1 | grep -qi "$pattern"; then
+    # Use grep without -q and redirect output to avoid broken pipe errors
+    if printf '%s\n' "$recent_logs" 2>/dev/null | grep -i "$pattern" >/dev/null 2>&1; then
       return 0  # Found errors
     fi
   done
 
   return 1  # No errors found
+}
+
+# Function to check pull_replication_log for successful replication
+# Returns 0 ONLY if replication completed WITHOUT errors
+check_pull_replication_log() {
+  local cid="$1"
+
+  # Check if the log file exists and has content
+  if docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
+    local log_content
+    log_content=$(docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "")
+
+    if [ -n "$log_content" ]; then
+      # FIRST check for errors - these take priority
+      # Use grep without -q and redirect stdout to /dev/null to avoid broken pipe errors
+      # The -q flag causes grep to exit immediately on match, which sends SIGPIPE to printf
+      if printf '%s\n' "$log_content" 2>/dev/null | grep -iE "Cannot replicate|TransportException|git-upload-pack not permitted|failed|error|Exception" >/dev/null 2>&1; then
+        return 1  # Found errors, replication failed
+      fi
+
+      # Check for successful completion only if no errors
+      if printf '%s\n' "$log_content" 2>/dev/null | grep "completed" >/dev/null 2>&1; then
+        return 0  # Replication completed successfully
+      fi
+    fi
+  fi
+  return 1  # No successful replication found
+}
+
+# Function to show pull_replication_log content
+show_pull_replication_log() {
+  local cid="$1"
+
+  echo "  Pull replication log:"
+  if docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
+    local content
+    content=$(docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "")
+    if [ -n "$content" ]; then
+      printf '%s\n' "$content" | tail -50 | sed 's/^/    /'
+    else
+      echo "    (empty)"
+    fi
+  else
+    echo "    (file not found)"
+  fi
+}
+
+# Function to check if project has been replicated (has packed-refs or refs/heads)
+check_project_replicated() {
+  local cid="$1"
+  local project="$2"
+
+  local project_git="/var/gerrit/git/${project}.git"
+
+  # Check for packed-refs (created after git gc or fetch)
+  if docker exec "$cid" test -f "$project_git/packed-refs" 2>/dev/null; then
+    return 0  # Has packed-refs, replication successful
+  fi
+
+  # Check for any refs in refs/heads (branches)
+  local head_count
+  head_count=$(docker exec "$cid" sh -c "find '$project_git/refs/heads' -type f 2>/dev/null | wc -l" || echo "0")
+  if [ "$head_count" -gt 0 ]; then
+    return 0  # Has branches, replication successful
+  fi
+
+  return 1  # No content found
+}
+
+# Function to verify repos have actual content (not just empty pre-created dirs)
+verify_repos_have_content() {
+  local cid="$1"
+
+  # Count repos that have either packed-refs or refs/heads content
+  local repos_with_content=0
+  local total_repos=0
+
+  while IFS= read -r repo_path; do
+    [ -z "$repo_path" ] && continue
+    # Skip All-Projects and All-Users
+    if [[ "$repo_path" == *"All-Projects"* ]] || [[ "$repo_path" == *"All-Users"* ]]; then
+      continue
+    fi
+
+    total_repos=$((total_repos + 1))
+
+    # Check for packed-refs
+    if docker exec "$cid" test -f "$repo_path/packed-refs" 2>/dev/null; then
+      repos_with_content=$((repos_with_content + 1))
+      continue
+    fi
+
+    # Check for refs/heads content
+    local head_count
+    head_count=$(docker exec "$cid" sh -c "find '$repo_path/refs/heads' -type f 2>/dev/null | wc -l" || echo "0")
+    if [ "$head_count" -gt 0 ]; then
+      repos_with_content=$((repos_with_content + 1))
+    fi
+  done < <(docker exec "$cid" find /var/gerrit/git -name '*.git' -type d 2>/dev/null)
+
+  echo "$repos_with_content/$total_repos"
+
+  # Return success only if at least 50% of repos have content
+  # This ensures we don't pass verification with only a few repos replicated
+  if [ "$total_repos" -gt 0 ]; then
+    local percentage=$((repos_with_content * 100 / total_repos))
+    [ "$percentage" -ge 50 ]
+  else
+    return 1
+  fi
+}
+
+# Function to get the expected project count from instances metadata
+get_expected_project_count() {
+  local slug="$1"
+
+  if [ -f "$WORK_DIR/instances.json" ]; then
+    local count
+    count=$(jq -r ".\"$slug\".expected_project_count // 0" "$WORK_DIR/instances.json" 2>/dev/null || echo "0")
+    echo "$count"
+  else
+    echo "0"
+  fi
+}
+
+# Function to validate project count against expected
+validate_project_count() {
+  local cid="$1"
+  local slug="$2"
+  local expected_count="$3"
+
+  local actual_count
+  actual_count=$(count_repositories "$cid")
+
+  # Subtract 2 for All-Projects and All-Users which are local-only
+  local comparable_count=$((actual_count - 2))
+  if [ "$comparable_count" -lt 0 ]; then
+    comparable_count=0
+  fi
+
+  echo "  Expected projects from remote: $expected_count"
+  echo "  Local repository count: $actual_count (excluding system repos: $comparable_count)"
+
+  if [ "$expected_count" -eq 0 ]; then
+    echo "  ⚠️ No expected count available, skipping count validation"
+    return 0
+  fi
+
+  # Allow 5% tolerance for project count mismatch
+  local min_required=$((expected_count * 95 / 100))
+
+  if [ "$comparable_count" -ge "$min_required" ]; then
+    echo "  ✅ Project count matches expected (within 5% tolerance)"
+    return 0
+  else
+    local percentage=$((comparable_count * 100 / expected_count))
+    echo "  ⚠️ Project count mismatch: got $percentage% of expected projects"
+    return 1
+  fi
 }
 
 # Function to count replicated repositories
@@ -68,55 +273,273 @@ count_repositories() {
     || echo "0"
 }
 
+# Function to list all repositories in git directory
+list_repositories() {
+  local cid="$1"
+  local max_items="${2:-20}"
+
+  echo "  Repository listing (max $max_items):"
+  docker exec "$cid" sh -c \
+    "find /var/gerrit/git -name '*.git' -type d 2>/dev/null | head -$max_items" | \
+    sed 's/^/    /' || echo "    (none found)"
+}
+
+# Function to show disk usage of git directory
+show_git_disk_usage() {
+  local cid="$1"
+
+  echo "  Git directory disk usage:"
+  docker exec "$cid" sh -c \
+    "du -sh /var/gerrit/git 2>/dev/null" | \
+    sed 's/^/    /' || echo "    (unable to determine)"
+}
+
+# Function to check for fetch/HTTP activity in logs
+# Uses --tail to limit output and avoid pipe buffer issues with large logs
+check_fetch_activity() {
+  local cid="$1"
+
+  local fetch_logs
+  fetch_logs=$(docker logs --tail 3000 "$cid" 2>&1 | \
+    grep -iE "fetch|http|GET|POST|clone|pull" | \
+    grep -v "healthcheck" | \
+    tail -20 || echo "")
+
+  if [ -n "$fetch_logs" ]; then
+    echo "  Recent fetch/HTTP activity:"
+    printf '%s\n' "$fetch_logs" | sed 's/^/    /'
+    return 0
+  fi
+  return 1
+}
+
+# Function to show secure.config status (without exposing credentials)
+check_secure_config() {
+  local cid="$1"
+
+  if docker exec "$cid" test -f /var/gerrit/etc/secure.config; then
+    echo "  secure.config exists ✅"
+    # Show structure without values
+    echo "  secure.config sections:"
+    docker exec "$cid" sh -c \
+      "grep '^\[' /var/gerrit/etc/secure.config 2>/dev/null" | \
+      sed 's/^/    /' || echo "    (no sections found)"
+    return 0
+  else
+    echo "  ::warning::secure.config not found"
+    return 1
+  fi
+}
+
 # Function to wait for replication activity
 wait_for_replication() {
   local cid="$1"
   local timeout="$2"
   local slug="$3"
+  local project="$4"
 
   local elapsed=0
-  local interval=10
+  local interval=5  # Check every 5 seconds for faster feedback
   local initial_count
   local current_count
   local last_count
+  local disk_usage
+  local last_disk_usage="0"
 
   initial_count=$(count_repositories "$cid")
   last_count=$initial_count
 
+  # Get expected project count for validation
+  local expected_count
+  expected_count=$(get_expected_project_count "$slug")
+
   echo "  Initial repository count: $initial_count"
+  if [ "$expected_count" -gt 0 ]; then
+    echo "  Expected projects from remote: $expected_count"
+  fi
   echo "  Waiting up to ${timeout}s for replication..."
+  echo "  (FetchAll is scheduled 30 seconds after plugin load)"
+  echo ""
+
+  # Show initial state
+  show_git_disk_usage "$cid"
+  echo ""
 
   while [ "$elapsed" -lt "$timeout" ]; do
     sleep "$interval"
     elapsed=$((elapsed + interval))
 
+    # FIRST: Check for replication ERRORS - fail fast if found
+    if check_replication_errors "$cid"; then
+      echo ""
+      echo "  ❌ Replication errors detected in logs!"
+      show_pull_replication_log "$cid"
+      return 1  # Fail immediately on errors
+    fi
+
+    # SECOND: Look for "completed" in pull_replication_log (without errors)
+    # Note: "completed" messages are per-repo, so we need to also verify content threshold
+    if check_pull_replication_log "$cid"; then
+      # Verify repos actually have content before declaring success
+      local content_status
+      # Get only the last line of output (the X/Y format) and strip any non-printable chars
+      content_status=$(verify_repos_have_content "$cid" 2>/dev/null | tail -1 | tr -cd '0-9/' || echo "0/0")
+
+      # Validate format and provide default if malformed
+      if ! echo "$content_status" | grep -qE '^[0-9]+/[0-9]+$'; then
+        content_status="0/0"
+      fi
+
+      # Extract numbers from content_status (format: "X/Y")
+      local repos_with_content
+      local total_repos
+      repos_with_content=$(echo "$content_status" | cut -d'/' -f1)
+      total_repos=$(echo "$content_status" | cut -d'/' -f2)
+
+      # Only declare success if we have enough content
+      if [ "$total_repos" -gt 0 ]; then
+        local percentage=$((repos_with_content * 100 / total_repos))
+
+        # If we have a specific project, verify it has content
+        if [ -n "$project" ]; then
+          if check_project_replicated "$cid" "$project"; then
+            echo ""
+            echo "  ✅ Replication completed (found in pull_replication_log)"
+            show_pull_replication_log "$cid"
+            echo "  Repos with content: $content_status ($percentage%)"
+            echo "  ✅ Project $project has content (replication verified)"
+            return 0
+          fi
+          # Project not ready yet, continue waiting
+        else
+          # Check if at least 50% of repos have content
+          if [ "$percentage" -ge 50 ]; then
+            echo ""
+            echo "  ✅ Replication completed (found in pull_replication_log)"
+            show_pull_replication_log "$cid"
+            echo "  Repos with content: $content_status ($percentage%)"
+            return 0
+          fi
+          # Not enough content yet, continue waiting
+          # Show progress every 15 seconds or on first check
+          if [ "$elapsed" -eq 5 ] || [ $((elapsed % 15)) -eq 0 ]; then
+            echo "  [${elapsed}s] Replication in progress: $content_status ($percentage%)"
+          fi
+        fi
+      fi
+    fi
+
+    # Get current counts
     current_count=$(count_repositories "$cid")
+    disk_usage=$(docker exec "$cid" sh -c \
+      "du -sb /var/gerrit/git 2>/dev/null | cut -f1" || echo "0")
 
     # Check if we have more than just All-Projects and All-Users
+    # AND verify they have content (not just empty pre-created dirs)
+    # AND validate that we have at least 50% of repos with content
     if [ "$current_count" -gt 2 ]; then
-      echo "  ✅ Repositories detected after ${elapsed}s: $current_count"
-      return 0
+      # Get content status (only call once to avoid inconsistency)
+      local content_status
+      # Get only the last line of output (the X/Y format) and strip any non-printable chars
+      content_status=$(verify_repos_have_content "$cid" 2>/dev/null | tail -1 | tr -cd '0-9/' || echo "0/0")
+
+      # Validate format and provide default if malformed
+      if ! echo "$content_status" | grep -qE '^[0-9]+/[0-9]+$'; then
+        content_status="0/0"
+      fi
+
+      # Extract numbers from content_status (format: "X/Y")
+      local repos_with_content
+      local total_repos
+      repos_with_content=$(echo "$content_status" | cut -d'/' -f1)
+      total_repos=$(echo "$content_status" | cut -d'/' -f2)
+
+      if [ "$total_repos" -gt 0 ]; then
+        local percentage=$((repos_with_content * 100 / total_repos))
+
+        # Check if at least 50% of repos have content
+        if [ "$percentage" -ge 50 ]; then
+          echo ""
+          echo "  ✅ Repositories with content: $content_status ($percentage%)"
+          show_git_disk_usage "$cid"
+
+          # Validate against expected count if available
+          if [ "$expected_count" -gt 0 ]; then
+            echo ""
+            validate_project_count "$cid" "$slug" "$expected_count"
+          fi
+
+          return 0
+        fi
+      fi
     fi
 
     # Check if count is increasing (replication in progress)
     if [ "$current_count" -gt "$last_count" ]; then
-      echo "  Progress: $current_count repositories (${elapsed}s elapsed)"
+      echo "  [${elapsed}s] Progress: $current_count repositories"
       last_count=$current_count
     fi
 
-    # Check for errors
-    if check_replication_errors "$cid"; then
-      echo "  ::warning::Replication errors detected in logs"
+    # Check if disk usage is increasing (data being written)
+    if [ "$disk_usage" != "$last_disk_usage" ] && \
+       [ "$disk_usage" -gt "$last_disk_usage" ] 2>/dev/null; then
+      local disk_mb
+      disk_mb=$((disk_usage / 1024 / 1024))
+      echo "  [${elapsed}s] Disk activity: ${disk_mb}MB in git directory"
+      last_disk_usage=$disk_usage
     fi
 
-    # Print status every 30 seconds
+    # Print status every 15 seconds (more frequent updates)
+    if [ $((elapsed % 15)) -eq 0 ]; then
+      local disk_human
+      disk_human=$(docker exec "$cid" sh -c \
+        "du -sh /var/gerrit/git 2>/dev/null | cut -f1" || echo "?")
+      echo "  [${elapsed}s/${timeout}s] repos=$current_count disk=$disk_human"
+
+      # Check pull_replication_log for activity
+      local repl_log
+      repl_log=$(docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null | tail -3 || echo "")
+      if [ -n "$repl_log" ]; then
+        echo "  Pull replication activity:"
+        printf '%s\n' "$repl_log" | sed 's/^/    /'
+      fi
+    fi
+
+    # Check for errors every 30 seconds
     if [ $((elapsed % 30)) -eq 0 ]; then
-      echo "  Still waiting... ${elapsed}s/${timeout}s"
+      if check_replication_errors "$cid"; then
+        echo "  ::warning::Replication errors detected in logs"
+      fi
     fi
   done
 
-  # Timeout reached
-  echo "  ⚠️ Timeout after ${timeout}s, current count: $current_count"
+  # Timeout reached - show detailed diagnostics
+  echo ""
+  echo "  ⚠️ Timeout after ${timeout}s"
+  echo ""
+  echo "  === Final State ==="
+  echo "  Repository count: $current_count"
+  show_git_disk_usage "$cid"
+  echo ""
+  show_pull_replication_log "$cid"
+  echo ""
+  list_repositories "$cid" 10
+  echo ""
+  check_secure_config "$cid"
+  echo ""
+  echo "  === Recent Container Log Activity ==="
+  docker logs --tail 50 "$cid" 2>&1 | \
+    grep -iE "replication|fetch|pull|remote|error|exception|failed" | \
+    tail -20 | sed 's/^/    /' || echo "    (no relevant logs)"
+  echo ""
+
+  # Final validation against expected count
+  if [ "$expected_count" -gt 0 ]; then
+    echo ""
+    echo "  === Project Count Validation ==="
+    validate_project_count "$cid" "$slug" "$expected_count"
+  fi
+
   return 1
 }
 
@@ -161,7 +584,8 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   echo "Step 1: Verifying pull-replication plugin..."
 
   if check_plugin_loaded "$cid"; then
-    PLUGIN_VERSION_LOG=$(docker logs "$cid" 2>&1 | \
+    # Try to get the plugin version from logs, using tail to limit output
+    PLUGIN_VERSION_LOG=$(docker logs --tail 2000 "$cid" 2>&1 | \
       grep "Loaded plugin pull-replication" | tail -1 || echo "")
     echo "  $PLUGIN_VERSION_LOG"
     echo "  Pull-replication plugin loaded ✅"
@@ -178,29 +602,40 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   if docker exec "$cid" test -f /var/gerrit/etc/replication.config; then
     echo "  replication.config found ✅"
 
-    if [ "${DEBUG:-false}" = "true" ]; then
-      echo "  Configuration content:"
-      docker exec "$cid" cat /var/gerrit/etc/replication.config 2>/dev/null | \
-        sed 's/^/    /' || true
-    fi
+    # Always show configuration for debugging replication issues
+    echo "  Configuration content:"
+    docker exec "$cid" cat /var/gerrit/etc/replication.config 2>/dev/null | \
+      grep -v "^#" | grep -v "^$" | sed 's/^/    /' || true
   else
     echo "::error::replication.config not found ❌"
     VERIFICATION_FAILED=$((VERIFICATION_FAILED + 1))
     continue
   fi
 
-  # Step 3: Check for replication errors
+  # Check secure.config for credentials
+  echo ""
+  echo "Step 2b: Verifying authentication configuration..."
+  check_secure_config "$cid"
+
+  # Step 3: Check for replication errors - THIS IS CRITICAL
   echo ""
   echo "Step 3: Checking for replication errors..."
 
   if check_replication_errors "$cid"; then
-    echo "::warning::Replication errors detected in container logs"
-    echo "  Recent error-related logs:"
-    docker logs "$cid" 2>&1 | \
-      grep -iE "error|exception|failed|denied" | \
-      grep -i "replication\|pull-replication" | \
-      tail -10 | sed 's/^/    /' || true
+    echo "::error::Replication errors detected! ❌"
     echo ""
+    echo "  Pull replication log errors:"
+    show_pull_replication_log "$cid"
+    echo ""
+    echo "  Container log errors:"
+    docker logs --tail 3000 "$cid" 2>&1 | \
+      grep -iE "Cannot replicate|TransportException|git-upload-pack|error|exception|failed|denied" | \
+      tail -20 | sed 's/^/    /' || true
+    echo ""
+
+    # This is a HARD FAILURE - replication errors mean we can't continue
+    VERIFICATION_FAILED=$((VERIFICATION_FAILED + 1))
+    continue
   else
     echo "  No replication errors detected ✅"
   fi
@@ -209,7 +644,7 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   echo ""
   echo "Step 4: Waiting for replicated repositories..."
 
-  if wait_for_replication "$cid" "$REPLICATION_WAIT_TIMEOUT" "$slug"; then
+  if wait_for_replication "$cid" "$REPLICATION_WAIT_TIMEOUT" "$slug" "$project"; then
     echo "  Replication verified ✅"
 
     # List some repositories
@@ -225,13 +660,39 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
     # Show recent replication-related logs for debugging
     echo ""
     echo "  Recent replication logs:"
-    docker logs "$cid" 2>&1 | \
+    docker logs --tail 3000 "$cid" 2>&1 | \
       grep -i "replication\|pull-replication\|fetch\|remote" | \
       tail -20 | sed 's/^/    /' || true
 
     VERIFICATION_FAILED=$((VERIFICATION_FAILED + 1))
     continue
   fi
+
+  # Step 5: Final disk usage and project count report
+  echo ""
+  echo "Step 5: Final replication statistics..."
+
+  final_count=$(count_repositories "$cid")
+  expected_count=$(get_expected_project_count "$slug")
+
+  echo "  Final repository count: $final_count"
+  if [ "$expected_count" -gt 0 ]; then
+    echo "  Expected from remote: $expected_count"
+  fi
+
+  # Get final content stats
+  # Get only the last line of output (the X/Y format) and strip any non-printable chars
+  content_stats=$(verify_repos_have_content "$cid" 2>/dev/null | tail -1 | tr -cd '0-9/' || echo "0/0")
+  if ! echo "$content_stats" | grep -qE '^[0-9]+/[0-9]+$'; then
+    content_stats="0/0"
+  fi
+  echo "  Repositories with content: $content_stats"
+
+  # Show final disk usage
+  show_git_disk_usage "$cid"
+
+  # Store stats for summary
+  echo "$slug|$final_count|$expected_count|$content_stats" >> "$WORK_DIR/replication_stats.txt"
 
   echo ""
   echo "✅ Instance $slug verification passed"
@@ -250,19 +711,46 @@ if [ $VERIFICATION_FAILED -eq 0 ]; then
   echo "All replication verifications passed! ✅"
   echo ""
 
+  # Show final disk usage summary
+  echo "========================================"
+  echo "Disk Usage Summary"
+  echo "========================================"
+  for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
+    cid=$(jq -r ".\"$slug\".cid" "$INSTANCES_JSON_FILE")
+    echo ""
+    echo "Instance: $slug"
+    docker exec "$cid" sh -c "du -sh /var/gerrit/git 2>/dev/null" | sed 's/^/  /' || echo "  (unable to determine)"
+  done
+  echo ""
+
   # Add to step summary
   {
-    echo "**Replication Verification** ✅"
+    echo "## Replication Verification ✅"
     echo ""
     echo "All instances successfully replicated from source Gerrit servers."
     echo ""
-    echo "| Instance | Status |"
-    echo "|----------|--------|"
+    echo "### Instance Details"
+    echo ""
+    echo "| Instance | Repos | Expected | With Content | Disk Usage |"
+    echo "|----------|-------|----------|--------------|------------|"
   } >> "$GITHUB_STEP_SUMMARY"
 
-  for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
-    echo "| $slug | ✅ Verified |" >> "$GITHUB_STEP_SUMMARY"
-  done
+  # Read stats from temp file if available
+  if [ -f "$WORK_DIR/replication_stats.txt" ]; then
+    while IFS='|' read -r slug final_count expected_count content_stats; do
+      cid=$(jq -r ".\"$slug\".cid" "$INSTANCES_JSON_FILE")
+      disk_usage=$(docker exec "$cid" sh -c "du -sh /var/gerrit/git 2>/dev/null | cut -f1" || echo "?")
+      expected_display="$expected_count"
+      if [ "$expected_count" -eq 0 ]; then
+        expected_display="N/A"
+      fi
+      echo "| $slug | $final_count | $expected_display | $content_stats | $disk_usage |" >> "$GITHUB_STEP_SUMMARY"
+    done < "$WORK_DIR/replication_stats.txt"
+  else
+    for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
+      echo "| $slug | ✅ | - | - | - |" >> "$GITHUB_STEP_SUMMARY"
+    done
+  fi
 
   echo "" >> "$GITHUB_STEP_SUMMARY"
 else

@@ -4,6 +4,10 @@
 
 # Trigger Gerrit replication
 # This script initiates pull-replication for all configured instances
+#
+# Key insight: The pull-replication plugin's replicateOnStartup feature
+# schedules a FetchAll 30 seconds after the plugin loads (see OnStartStop.java).
+# This script waits for that scheduled task to complete.
 
 set -euo pipefail
 
@@ -11,13 +15,22 @@ echo "Triggering initial replication..."
 echo ""
 
 # Function to check plugin status via container logs
+# Uses --tail to limit output and avoid pipe buffer issues with large logs
 check_plugin_in_logs() {
   local cid="$1"
   local plugin_name="$2"
 
-  if docker logs "$cid" 2>&1 | grep -q "Loaded plugin $plugin_name"; then
+  # Check recent logs first (most reliable)
+  # Use grep without -q and redirect stdout to /dev/null to avoid broken pipe errors
+  if docker logs --tail 1000 "$cid" 2>&1 | grep "Loaded plugin $plugin_name" >/dev/null 2>&1; then
     return 0
   fi
+
+  # Fallback: check full logs with head to limit output
+  if docker logs "$cid" 2>&1 | head -n 5000 | grep "Loaded plugin $plugin_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
   return 1
 }
 
@@ -118,47 +131,103 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
     fi
   fi
 
-  # Alternative: Check replication via filesystem/logs
+  # Wait for replicateOnStartup FetchAll to complete
+  # The pull-replication plugin schedules FetchAll 30 seconds after startup
+  # (see OnStartStop.java: fetchAll.schedule(30, TimeUnit.SECONDS))
   echo ""
-  echo "Monitoring replication activity..."
+  echo "Waiting for replicateOnStartup FetchAll to complete..."
+  echo "(FetchAll is scheduled 30 seconds after plugin load)"
 
-  # Give replication a moment to start
-  sleep 5
+  # Wait up to 60 seconds for replication to start and complete
+  MAX_WAIT=60
+  WAITED=0
+  REPLICATION_STARTED=false
 
-  # Check replication logs
-  REPL_LOGS=$(docker logs "$cid" 2>&1 | \
-    grep -i "pull-replication\|replication" | tail -20 || echo "")
+  while [ $WAITED -lt $MAX_WAIT ]; do
+    # Check pull_replication_log for activity
+    if docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
+      REPL_LOG_CONTENT=$(docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "")
+      if [ -n "$REPL_LOG_CONTENT" ]; then
+        REPLICATION_STARTED=true
+        # Check if replication completed
+        # Use grep without -q and redirect stdout to /dev/null to avoid broken pipe errors
+        # The -q flag causes grep to exit immediately on match, which sends SIGPIPE to printf
+        if printf '%s\n' "$REPL_LOG_CONTENT" 2>/dev/null | grep "completed" >/dev/null 2>&1; then
+          echo "✅ Replication activity detected and completed"
+          break
+        fi
+      fi
+    fi
 
-  if [ -n "$REPL_LOGS" ]; then
-    echo "Recent replication activity:"
-    echo "$REPL_LOGS"
-    echo ""
-  else
-    echo "No replication activity detected yet"
-    echo "This is normal if replicateOnStartup is false"
-    echo "or if no projects match"
-    echo ""
+    sleep 5
+    WAITED=$((WAITED + 5))
+    if [ $((WAITED % 15)) -eq 0 ]; then
+      echo "  Still waiting... ${WAITED}s elapsed"
+    fi
+  done
+
+  if [ "$REPLICATION_STARTED" = "false" ] && [ $WAITED -ge $MAX_WAIT ]; then
+    echo "::warning::No replication activity detected after ${MAX_WAIT}s"
   fi
 
-  # Check if any repositories were created
+  # Show pull_replication_log content
+  echo ""
+  echo "Pull replication log:"
+  docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "(empty)"
+  echo ""
+
+  # Check container logs for any replication-related messages
+  echo "Container log replication activity:"
+  docker logs "$cid" 2>&1 | \
+    grep -iE "pull-replication|fetch|FetchAll" | tail -10 || echo "(none)"
+  echo ""
+
+  # Check if any repositories were created/populated
   REPO_COUNT=$(docker exec "$cid" sh -c \
     "find /var/gerrit/git -name '*.git' -type d 2>/dev/null | wc -l" \
     || echo "0")
 
   echo "Repositories in git directory: $REPO_COUNT"
 
-  if [ "$REPO_COUNT" -gt 2 ]; then
+  # List repositories
+  echo ""
+  echo "Repositories:"
+  docker exec "$cid" sh -c \
+    "find /var/gerrit/git -name '*.git' -type d 2>/dev/null" || true
+  echo ""
+
+  # Check if repos have actual content (packed-refs indicates successful fetch)
+  if [ -n "$project" ]; then
+    echo "Checking replicated content for project: $project"
+    PROJECT_GIT="/var/gerrit/git/${project}.git"
+
+    if docker exec "$cid" test -d "$PROJECT_GIT" 2>/dev/null; then
+      # Check for packed-refs (indicates successful fetch)
+      if docker exec "$cid" test -f "$PROJECT_GIT/packed-refs" 2>/dev/null; then
+        REFS_COUNT=$(docker exec "$cid" wc -l < "$PROJECT_GIT/packed-refs" 2>/dev/null || echo "0")
+        echo "  ✅ packed-refs found: $REFS_COUNT lines (replication successful)"
+
+        # Show branches
+        BRANCHES=$(docker exec "$cid" bash -c "cd $PROJECT_GIT && git branch 2>/dev/null" || echo "")
+        if [ -n "$BRANCHES" ]; then
+          echo "  Branches:"
+          printf '%s\n' "$BRANCHES" | while IFS= read -r branch; do
+            echo "    $branch"
+          done
+        fi
+      else
+        echo "  ⚠️ No packed-refs found (replication may not have completed)"
+        REPLICATION_FAILED=$((REPLICATION_FAILED + 1))
+      fi
+    else
+      echo "  ⚠️ Project directory not found: $PROJECT_GIT"
+      REPLICATION_FAILED=$((REPLICATION_FAILED + 1))
+    fi
+  elif [ "$REPO_COUNT" -gt 2 ]; then
     # More than All-Projects and All-Users
     echo "✅ Replication appears to be working (repositories detected)"
-
-    # List some repositories
-    echo ""
-    echo "Sample repositories:"
-    docker exec "$cid" sh -c \
-      "find /var/gerrit/git -maxdepth 2 -name '*.git' -type d \
-      2>/dev/null | head -5" || true
   elif [ "$SYNC_ON_STARTUP" = "true" ]; then
-    echo "::warning::No replicated repositories detected yet"
+    echo "::warning::No replicated repositories detected"
     echo "Replication may still be in progress or"
     echo "configured projects may not exist on source"
     REPLICATION_FAILED=$((REPLICATION_FAILED + 1))
