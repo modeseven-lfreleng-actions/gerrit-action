@@ -353,11 +353,31 @@ configure_gerrit() {
 
   local config_file="$instance_dir/etc/gerrit.config"
 
+  # Get API path to mirror production server's URL structure
+  local api_path
+  api_path=$(get_api_path "$slug")
+
+  # Build URLs with optional path prefix to mirror production server
+  # This allows scripts/tools to work identically against test and production
+  local canonical_url
+  local listen_url
+  if [ -n "$api_path" ]; then
+    # Ensure api_path starts with / but doesn't end with /
+    api_path="/${api_path#/}"
+    api_path="${api_path%/}"
+    canonical_url="http://localhost:${http_port}${api_path}"
+    listen_url="http://*:8080${api_path}/"
+    echo "  URL prefix: $api_path (mirroring production server)"
+  else
+    canonical_url="http://localhost:${http_port}"
+    listen_url="http://*:8080/"
+    echo "  URL prefix: (none)"
+  fi
+
   # Update gerrit.config
   git config -f "$config_file" gerrit.instanceId "$slug"
-  git config -f "$config_file" gerrit.canonicalWebUrl \
-    "http://localhost:$http_port"
-  git config -f "$config_file" httpd.listenUrl "http://*:8080/"
+  git config -f "$config_file" gerrit.canonicalWebUrl "$canonical_url"
+  git config -f "$config_file" httpd.listenUrl "$listen_url"
   git config -f "$config_file" sshd.listenAddress "*:29418"
 
   # Set auth to development mode for testing
