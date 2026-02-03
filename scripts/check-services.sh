@@ -89,10 +89,14 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   cid=$(jq -r ".\"$slug\".cid" "$INSTANCES_JSON_FILE")
   container_ip=$(jq -r ".\"$slug\".ip" "$INSTANCES_JSON_FILE")
   http_port=$(jq -r ".\"$slug\".http_port" "$INSTANCES_JSON_FILE")
+  api_path=$(jq -r ".\"$slug\".api_path // \"\"" "$INSTANCES_JSON_FILE")
 
   echo "Container ID: $cid"
   echo "IP Address: $container_ip"
   echo "HTTP Port: $http_port (container port 8080)"
+  if [ -n "$api_path" ]; then
+    echo "API Path: $api_path"
+  fi
   echo ""
 
   # Verify container is running
@@ -249,11 +253,15 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
       RETRY_COUNT=0
       HTTP_SUCCESS=false
 
+      # Build health check URL with optional API path prefix
+      HEALTH_URL="http://$container_ip:8080${api_path}/config/server/version"
+      echo "Health check URL: $HEALTH_URL"
+
       while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
         HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
           --connect-timeout 5 \
           --max-time 10 \
-          "http://$container_ip:8080/config/server/version" 2>/dev/null \
+          "$HEALTH_URL" 2>/dev/null \
           || echo "000")
 
         if [ "$HTTP_CODE" = "200" ] || \
@@ -299,7 +307,7 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
       echo "Pull-replication plugin loaded ✅ (verified via logs)"
     else
       # Method 2: Check via HTTP API (may not work for all auth configs)
-      PLUGIN_CHECK=$(curl -s "http://$container_ip:8080/plugins/" \
+      PLUGIN_CHECK=$(curl -s "http://$container_ip:8080${api_path}/plugins/" \
         2>/dev/null || echo "")
 
       if echo "$PLUGIN_CHECK" | grep "pull-replication" >/dev/null 2>&1; then
