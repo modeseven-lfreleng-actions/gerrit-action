@@ -18,10 +18,16 @@
 #     export GERRIT_HTTP_USERNAME="your-username"
 #     export GERRIT_HTTP_PASSWORD="your-password"
 #
-# Key insight: The pull-replication plugin's replicateOnStartup feature
-# iterates over projectCache.all() - meaning projects must exist locally
-# before they can be replicated. This script creates empty bare repos
-# for each project before starting Gerrit.
+# Replication approach: fetchEvery polling (default)
+# The pull-replication plugin is configured with fetchEvery which polls the
+# source Gerrit at regular intervals to fetch new/changed refs. This enables
+# full web UI access while maintaining automatic replication.
+#
+# Alternatively, set REPLICA_MODE=true to use the older replica-based approach
+# which uses replicateOnStartup but disables the web UI.
+#
+# Key insight: Projects must exist locally before they can be replicated.
+# This script creates empty bare repos for each project before starting Gerrit.
 
 set -euo pipefail
 
@@ -35,7 +41,10 @@ PLUGIN_VERSION="${PLUGIN_VERSION:-stable-3.13}"
 CONTAINER_NAME="gerrit-local-test"
 HTTP_PORT="${HTTP_PORT:-8080}"
 SSH_PORT="${SSH_PORT:-29418}"
-REPLICA_MODE="${REPLICA_MODE:-true}"
+FETCH_EVERY="${FETCH_EVERY:-60s}"
+# REPLICA_MODE: Set to 'true' to use replica mode (disables web UI)
+# Default is 'false' for fetchEvery polling mode (web UI enabled)
+REPLICA_MODE="${REPLICA_MODE:-false}"
 
 # Fetch project list from remote Gerrit server
 fetch_remote_projects() {
@@ -205,11 +214,15 @@ git config -f "$CONFIG_FILE" auth.type "DEVELOPMENT_BECOME_ANY_ACCOUNT"
 git config -f "$CONFIG_FILE" container.user "root"
 git config -f "$CONFIG_FILE" plugin.pull-replication.enabled "true"
 
-# Enable replica mode if requested
-# Replica mode is REQUIRED for replicateOnStartup to work!
+# Configure replication mode
 if [ "$REPLICA_MODE" = "true" ]; then
-  log_info "Enabling replica mode (required for replicateOnStartup)..."
+  log_info "Enabling replica mode (replicateOnStartup, no web UI)..."
   git config -f "$CONFIG_FILE" container.replica "true"
+else
+  log_info "Using fetchEvery polling mode (web UI enabled)..."
+  log_info "  Fetch interval: $FETCH_EVERY"
+  # Non-replica mode: web UI is fully functional
+  # Replication happens via fetchEvery polling
 fi
 
 log_success "Gerrit configured"
@@ -253,8 +266,11 @@ if [ -n "$PROJECT_FILTER" ] && [ "$PROJECT_FILTER" != "all" ]; then
 fi
 # Note: If PROJECTS_CONFIG is empty, all projects will be replicated
 
-cat > "$INSTANCE_DIR/etc/replication.config" <<EOF
-# Pull-replication configuration for local testing
+# Generate replication.config based on mode
+if [ "$REPLICA_MODE" = "true" ]; then
+  # Replica mode: uses apiUrl and replicateOnStartup
+  cat > "$INSTANCE_DIR/etc/replication.config" <<EOF
+# Pull-replication configuration for local testing (REPLICA MODE)
 # Key: replicateOnStartup requires projects to exist in local projectCache
 # The FetchAll iterates over projectCache.all() to find projects to replicate
 
@@ -282,6 +298,39 @@ cat > "$INSTANCE_DIR/etc/replication.config" <<EOF
   fetch = +refs/tags/*:refs/tags/*
 $(echo -e "$PROJECTS_CONFIG")
 EOF
+else
+  # fetchEvery mode: polls source at configured interval, web UI enabled
+  # Note: apiUrl is NOT used because it's mutually exclusive with fetchEvery
+  cat > "$INSTANCE_DIR/etc/replication.config" <<EOF
+# Pull-replication configuration for local testing (FETCHEVERY MODE)
+# The plugin polls the source Gerrit at regular intervals to fetch changes.
+# This enables full web UI access while maintaining automatic replication.
+
+[gerrit]
+  replicateOnStartup = false
+  autoReload = true
+
+[replication]
+  lockErrorMaxRetries = 5
+  maxRetries = 5
+  useCGitClient = false
+  refsBatchSize = 50
+
+[remote "source"]
+  url = ${GIT_URL}
+  fetchEvery = ${FETCH_EVERY}
+  timeout = 600
+  connectionTimeout = 120000
+  replicationDelay = 0
+  replicationRetry = 60
+  threads = 4
+  createMissingRepositories = true
+  replicateHiddenProjects = false
+  fetch = +refs/heads/*:refs/heads/*
+  fetch = +refs/tags/*:refs/tags/*
+$(echo -e "$PROJECTS_CONFIG")
+EOF
+fi
 
 log_success "replication.config created"
 echo ""
@@ -412,10 +461,17 @@ log_info "=== Plugin Status ==="
 docker logs "$CONTAINER_NAME" 2>&1 | grep -i "plugin" | tail -10
 echo ""
 
-# Wait for replicateOnStartup to trigger (scheduled 30 seconds after plugin start)
-log_info "=== Waiting for replicateOnStartup (triggers 30s after plugin load) ==="
-log_info "The FetchAll is scheduled with a 30-second delay..."
-sleep 35
+# Wait for replication to trigger
+if [ "$REPLICA_MODE" = "true" ]; then
+  log_info "=== Waiting for replicateOnStartup (triggers 30s after plugin load) ==="
+  log_info "The FetchAll is scheduled with a 30-second delay..."
+  sleep 35
+else
+  log_info "=== Waiting for fetchEvery polling to trigger ==="
+  log_info "First poll occurs within the fetch interval: $FETCH_EVERY"
+  log_info "Waiting 90 seconds for first poll cycle..."
+  sleep 90
+fi
 
 # Check for replication activity
 log_info "=== Replication Logs ==="

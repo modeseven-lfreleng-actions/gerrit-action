@@ -3,15 +3,57 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 # Trigger Gerrit replication
-# This script initiates pull-replication for all configured instances
+# This script monitors pull-replication for all configured instances
 #
-# Key insight: The pull-replication plugin's replicateOnStartup feature
-# schedules a FetchAll 30 seconds after the plugin loads (see OnStartStop.java).
-# This script waits for that scheduled task to complete.
+# Replication approach: fetchEvery polling
+# The pull-replication plugin is configured with fetchEvery which polls the
+# source Gerrit at regular intervals (default: 60s) to fetch new/changed refs.
+#
+# This approach:
+# - Enables full web UI access (non-replica mode)
+# - Provides automatic, self-healing replication
+# - First sync occurs within the configured poll interval
+#
+# This script:
+# 1. Verifies the pull-replication plugin is loaded
+# 2. Shows current replication configuration
+# 3. Optionally attempts SSH trigger for faster initial sync
+# 4. Waits for first poll cycle to show activity
 
 set -euo pipefail
 
 echo "Triggering initial replication..."
+echo ""
+
+# Get fetch interval (default 60s)
+FETCH_EVERY="${FETCH_EVERY:-60s}"
+
+# Function to parse time interval to seconds
+# Supports: 60s, 5m, 1h, etc.
+parse_interval_to_seconds() {
+  local interval="$1"
+  local value="${interval%[smhSMH]}"
+  local unit="${interval: -1}"
+
+  case "$unit" in
+    s|S) echo "$value" ;;
+    m|M) echo $((value * 60)) ;;
+    h|H) echo $((value * 3600)) ;;
+    *)   echo "$value" ;;  # Assume seconds if no unit
+  esac
+}
+
+# Calculate wait timeout based on fetch interval
+FETCH_INTERVAL_SECONDS=$(parse_interval_to_seconds "$FETCH_EVERY")
+# Wait for 1.5x the fetch interval to allow for first poll cycle
+MAX_WAIT=$((FETCH_INTERVAL_SECONDS * 3 / 2))
+# Minimum wait of 60 seconds
+if [ "$MAX_WAIT" -lt 60 ]; then
+  MAX_WAIT=60
+fi
+
+echo "Fetch interval: $FETCH_EVERY ($FETCH_INTERVAL_SECONDS seconds)"
+echo "Wait timeout: ${MAX_WAIT}s (1.5x fetch interval)"
 echo ""
 
 # Function to check plugin status via container logs
@@ -131,15 +173,15 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
     fi
   fi
 
-  # Wait for replicateOnStartup FetchAll to complete
-  # The pull-replication plugin schedules FetchAll 30 seconds after startup
-  # (see OnStartStop.java: fetchAll.schedule(30, TimeUnit.SECONDS))
+  # Wait for fetchEvery polling to trigger replication
+  # With fetchEvery configured, the plugin polls the source Gerrit at regular
+  # intervals (default: 60s) to fetch new/changed refs. The first poll occurs
+  # after the configured interval from when the plugin loads.
   echo ""
-  echo "Waiting for replicateOnStartup FetchAll to complete..."
-  echo "(FetchAll is scheduled 30 seconds after plugin load)"
+  echo "Waiting for fetchEvery polling to trigger replication..."
+  echo "(First poll occurs within the configured fetch interval: $FETCH_EVERY)"
 
-  # Wait up to 60 seconds for replication to start and complete
-  MAX_WAIT=60
+  # MAX_WAIT is calculated above based on FETCH_EVERY
   WAITED=0
   REPLICATION_STARTED=false
 
@@ -168,6 +210,8 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
 
   if [ "$REPLICATION_STARTED" = "false" ] && [ $WAITED -ge $MAX_WAIT ]; then
     echo "::warning::No replication activity detected after ${MAX_WAIT}s"
+    echo "This may be normal if the fetch interval is longer than ${MAX_WAIT}s"
+    echo "Replication will continue in the background via fetchEvery polling"
   fi
 
   # Show pull_replication_log content

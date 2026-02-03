@@ -6,6 +6,12 @@
 # This script waits for and validates that replication has completed
 # successfully for all configured instances
 #
+# Replication approach: fetchEvery polling
+# The pull-replication plugin is configured with fetchEvery which polls the
+# source Gerrit at regular intervals (default: 60s) to fetch new/changed refs.
+# This script waits for at least one poll cycle to complete and verifies
+# that repositories have been populated with content.
+#
 # Key insight: The pull-replication plugin logs activity to:
 #   /var/gerrit/logs/pull_replication_log
 # This is the primary source for verifying replication success.
@@ -16,7 +22,9 @@ echo "Verifying replication success..."
 echo ""
 
 # Default timeout if not set
-REPLICATION_WAIT_TIMEOUT="${REPLICATION_WAIT_TIMEOUT:-120}"
+# With fetchEvery polling, we need to wait at least one poll interval (default 60s)
+# plus time for the actual fetch operation. 180s provides ~3x the default interval.
+REPLICATION_WAIT_TIMEOUT="${REPLICATION_WAIT_TIMEOUT:-180}"
 
 # Read instances metadata
 if [ ! -f "$WORK_DIR/instances.json" ]; then

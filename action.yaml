@@ -80,6 +80,15 @@ inputs:
     description: "Trigger replication after startup"
     required: false
     default: 'true'
+  fetch_every:
+    description: |
+      Interval for pull-replication polling (e.g., '60s', '5m').
+      The pull-replication plugin will poll the source Gerrit at this
+      interval to fetch any new or changed refs. This enables automatic
+      replication while keeping the web UI fully functional.
+      Set to '0s' to disable automatic polling.
+    required: false
+    default: '60s'
   replication_timeout:
     description: "Timeout for initial replication sync (in seconds)"
     required: false
@@ -264,6 +273,8 @@ runs:
           >> "$GITHUB_STEP_SUMMARY"
         echo "- Sync on startup: \`${{ inputs.sync_on_startup }}\`" \
           >> "$GITHUB_STEP_SUMMARY"
+        echo "- Fetch interval: \`${{ inputs.fetch_every }}\`" \
+          >> "$GITHUB_STEP_SUMMARY"
         echo "- Caching enabled: \`${{ inputs.enable_cache }}\`" \
           >> "$GITHUB_STEP_SUMMARY"
         echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -349,6 +360,7 @@ runs:
         SYNC_REFS: ${{ inputs.sync_refs }}
         REPLICATION_THREADS: ${{ inputs.replication_threads }}
         SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
+        FETCH_EVERY: ${{ inputs.fetch_every }}
         REPLICATION_TIMEOUT: ${{ inputs.replication_timeout }}
         SKIP_PLUGIN_INSTALL: ${{ inputs.skip_plugin_install }}
         ADDITIONAL_PLUGINS: ${{ inputs.additional_plugins }}
@@ -395,6 +407,7 @@ runs:
         SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
         REQUIRE_REPLICATION_SUCCESS: ${{ inputs.require_replication_success }}
         REPLICATION_WAIT_TIMEOUT: ${{ inputs.replication_wait_timeout }}
+        FETCH_EVERY: ${{ inputs.fetch_every }}
       run: |
         # Trigger initial replication
         set -euo pipefail
@@ -407,6 +420,7 @@ runs:
       shell: bash
       env:
         REPLICATION_WAIT_TIMEOUT: ${{ inputs.replication_wait_timeout }}
+        FETCH_EVERY: ${{ inputs.fetch_every }}
         DEBUG: ${{ inputs.debug }}
       run: |
         # Verify replication success
