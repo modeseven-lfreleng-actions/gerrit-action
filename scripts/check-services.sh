@@ -91,11 +91,18 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   http_port=$(jq -r ".\"$slug\".http_port" "$INSTANCES_JSON_FILE")
   api_path=$(jq -r ".\"$slug\".api_path // \"\"" "$INSTANCES_JSON_FILE")
 
+  # Compute effective_api_path based on USE_API_PATH flag
+  # This must match the logic in start-instances.sh
+  effective_api_path=""
+  if [ "${USE_API_PATH:-false}" = "true" ] && [ -n "$api_path" ]; then
+    effective_api_path="$api_path"
+  fi
+
   echo "Container ID: $cid"
   echo "IP Address: $container_ip"
   echo "HTTP Port: $http_port (container port 8080)"
   if [ -n "$api_path" ]; then
-    echo "API Path: $api_path"
+    echo "API Path: $api_path (USE_API_PATH=${USE_API_PATH:-false})"
   fi
   echo ""
 
@@ -253,8 +260,32 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
       RETRY_COUNT=0
       HTTP_SUCCESS=false
 
-      # Build health check URL with optional API path prefix
-      HEALTH_URL="http://$container_ip:8080${api_path}/config/server/version"
+      # Build health check URL
+      #
+      # IMPORTANT: URL PATH CONFIGURATION - KEEP IN SYNC!
+      # ================================================
+      # The following files must be updated together if changing URL path handling:
+      #
+      #   1. scripts/start-instances.sh
+      #      - canonical_url and listen_url variables
+      #      - CANONICAL_WEB_URL and HTTPD_LISTEN_URL env vars in docker run
+      #
+      #   2. scripts/check-services.sh (this file)
+      #      - HEALTH_URL construction below (must match listen_url path)
+      #      - Plugin check URL further below (must match listen_url path)
+      #
+      #   3. test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml
+      #      - NEW_CANONICAL and NEW_LISTEN in "Recreate Gerrit container" step
+      #      - Health check URL in the same step
+      #
+      # When USE_API_PATH is true, we use the api_path to match the production
+      # server's URL structure. Otherwise, we use root (/).
+      #
+      if [ -n "$effective_api_path" ]; then
+        HEALTH_URL="http://$container_ip:8080${effective_api_path}/config/server/version"
+      else
+        HEALTH_URL="http://$container_ip:8080/config/server/version"
+      fi
       echo "Health check URL: $HEALTH_URL"
 
       while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
@@ -307,8 +338,14 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
       echo "Pull-replication plugin loaded ✅ (verified via logs)"
     else
       # Method 2: Check via HTTP API (may not work for all auth configs)
-      PLUGIN_CHECK=$(curl -s "http://$container_ip:8080${api_path}/plugins/" \
-        2>/dev/null || echo "")
+      # NOTE: URL path must match listen_url - see KEEP IN SYNC comment above
+      if [ -n "$effective_api_path" ]; then
+        PLUGIN_CHECK=$(curl -s "http://$container_ip:8080${effective_api_path}/plugins/" \
+          2>/dev/null || echo "")
+      else
+        PLUGIN_CHECK=$(curl -s "http://$container_ip:8080/plugins/" \
+          2>/dev/null || echo "")
+      fi
 
       if echo "$PLUGIN_CHECK" | grep "pull-replication" >/dev/null 2>&1; then
         echo "Pull-replication plugin detected ✅"

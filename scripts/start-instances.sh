@@ -519,19 +519,60 @@ start_instance() {
   local api_path
   api_path=$(get_api_path "$slug")
 
-  # Build URLs with optional path prefix to mirror production server
+  # Check if USE_API_PATH is enabled (default: false)
+  # When false, we ignore api_path for local URLs but still store it for reference
+  local effective_api_path=""
+  if [ "${USE_API_PATH:-false}" = "true" ] && [ -n "$api_path" ]; then
+    effective_api_path="$api_path"
+  fi
+
+  # Build URLs using effective_api_path (may be empty if USE_API_PATH is false)
+  #
+  # IMPORTANT: URL PATH CONFIGURATION - KEEP IN SYNC!
+  # ================================================
+  # The following files must be updated together if changing URL path handling:
+  #
+  #   1. scripts/start-instances.sh (this file)
+  #      - canonical_url and listen_url variables below
+  #      - CANONICAL_WEB_URL and HTTPD_LISTEN_URL env vars in docker run
+  #
+  #   2. scripts/check-services.sh
+  #      - HEALTH_URL construction (must match listen_url path)
+  #      - Plugin check URL (must match listen_url path)
+  #
+  #   3. test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml
+  #      - NEW_CANONICAL and NEW_LISTEN in "Recreate Gerrit container" step
+  #      - Health check URL in the same step
+  #
+  # When USE_API_PATH is true and api_path is detected, the local container
+  # will use the same URL structure as the production server. This ensures:
+  # - Clone URLs displayed in the web UI match the expected format
+  # - Static content is served from the correct path prefix
+  # - Health checks and API endpoints use consistent paths
+  #
+  # When USE_API_PATH is false (default), the container serves at root (/)
+  # which avoids potential issues with static asset loading in PolyGerrit.
+  #
   local canonical_url
   local listen_url
-  if [ -n "$api_path" ]; then
-    # Ensure api_path starts with / but doesn't end with /
-    api_path="/${api_path#/}"
-    api_path="${api_path%/}"
-    canonical_url="http://localhost:${http_port}${api_path}"
-    listen_url="http://*:8080${api_path}/"
+  if [ -n "$effective_api_path" ]; then
+    # Use api_path to match production server structure
+    canonical_url="http://localhost:${http_port}${effective_api_path}/"
+    listen_url="http://*:8080${effective_api_path}/"
+    echo "  Using API path: $effective_api_path (USE_API_PATH=true)"
   else
-    canonical_url="http://localhost:${http_port}"
+    # No api_path - serve at root
+    canonical_url="http://localhost:${http_port}/"
     listen_url="http://*:8080/"
+    if [ -n "$api_path" ]; then
+      echo "  API path detected ($api_path) but USE_API_PATH is false"
+      echo "  Serving at root instead"
+    fi
   fi
+
+  # Export for use by other steps (e.g., bore tunnel config updates)
+  echo "GERRIT_CANONICAL_URL=$canonical_url" >> "$WORK_DIR/env.sh"
+  echo "GERRIT_LISTEN_URL=$listen_url" >> "$WORK_DIR/env.sh"
 
   echo ""
   echo "========================================"
@@ -586,7 +627,8 @@ start_instance() {
     -d
     --name "$container_name"
     --cidfile "$cidfile"
-    --rm
+    # NOTE: --rm removed so containers can be stopped/started without recreation
+    # This allows config changes to persist across restarts
     -p "$http_port:8080"
     -p "$ssh_port:29418"
     -v "$instance_dir/git:/var/gerrit/git"
@@ -597,10 +639,11 @@ start_instance() {
     -v "$instance_dir/logs:/var/gerrit/logs"
     -v "$instance_dir/plugins:/var/gerrit/plugins"
     -v "$instance_dir/tmp:/var/gerrit/tmp"
-    # Include the full URL with path prefix - the Gerrit Docker entrypoint
-    # overwrites gerrit.canonicalWebUrl from this env var on every start
+    # Pass CANONICAL_WEB_URL so the entrypoint sets it correctly
+    # The Gerrit Docker entrypoint overwrites gerrit.config from this env var
+    # on every container start. We must pass it to prevent the entrypoint from
+    # defaulting to the container hostname.
     -e "CANONICAL_WEB_URL=$canonical_url"
-    # Also set HTTPD_LISTEN_URL so the entrypoint configures the listen URL
     -e "HTTPD_LISTEN_URL=$listen_url"
   )
 
