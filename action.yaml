@@ -140,6 +140,20 @@ inputs:
     description: "Skip pull-replication plugin installation (testing)"
     required: false
     default: 'false'
+  ssh_auth_keys:
+    description: |
+      SSH public keys to add for accessing the Gerrit container.
+      One key per line, in standard authorized_keys format.
+      These keys will be added to an admin account (ID 1000000)
+      allowing SSH access to the Gerrit container for debugging
+      or automation purposes.
+
+      Example:
+        ssh_auth_keys: |
+          ssh-ed25519 AAAAC3... user@example.com
+          ecdsa-sha2-nistp256 AAAAE2... another@example.com
+    required: false
+    default: ''
 
 outputs:
   container_ids:
@@ -357,6 +371,19 @@ runs:
         set -euo pipefail
 
         source "${{ github.action_path }}/scripts/check-services.sh"
+
+    # Add SSH authentication keys for user access
+    - name: "Add SSH authentication keys"
+      if: inputs.ssh_auth_keys != ''
+      shell: bash
+      env:
+        SSH_AUTH_KEYS: ${{ inputs.ssh_auth_keys }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Add SSH authentication keys for user access
+        set -euo pipefail
+
+        source "${{ github.action_path }}/scripts/add-ssh-auth-keys.sh"
 
     # Trigger initial replication
     - name: "Trigger initial replication"
