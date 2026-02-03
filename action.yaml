@@ -139,6 +139,14 @@ inputs:
     description: "Enables debugging output"
     required: false
     default: 'false'
+  use_api_path:
+    description: |
+      When true, the local Gerrit container will use the same URL context
+      path as the source/origin server (e.g., /r, /infra). This ensures
+      that clone URLs and static content paths match the production server.
+      When false, the container serves at root (/).
+    required: false
+    default: 'false'
   additional_plugins:
     description: "Comma-separated list of extra plugin URLs to install"
     required: false
@@ -366,6 +374,7 @@ runs:
         ADDITIONAL_PLUGINS: ${{ inputs.additional_plugins }}
         GERRIT_INIT_ARGS: ${{ inputs.gerrit_init_args }}
         DEBUG: ${{ inputs.debug }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
       run: |
         # Start Gerrit instances
         set -euo pipefail
@@ -378,6 +387,7 @@ runs:
       shell: bash
       env:
         SKIP_PLUGIN_INSTALL: ${{ inputs.skip_plugin_install }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
       run: |
         # Check Gerrit service availability
         set -euo pipefail

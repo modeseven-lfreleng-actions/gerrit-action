@@ -70,6 +70,14 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
     else
       echo "Container stopped gracefully ✅"
     fi
+
+    # Remove the container (no longer using --rm flag)
+    echo "Removing container..."
+    if docker rm "$cid" 2>/dev/null; then
+      echo "Container removed ✅"
+    else
+      echo "::warning::Failed to remove container $cid (may already be removed)"
+    fi
   else
     echo "Container not running, removing..."
     docker rm -f "$cid" 2>/dev/null || {
