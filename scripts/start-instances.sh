@@ -316,6 +316,7 @@ init_gerrit_site() {
   local instance_dir="$1"
   local slug="$2"
   local http_port="$3"
+  local canonical_url="$4"
 
   echo "Initializing Gerrit site for $slug..."
 
@@ -333,7 +334,7 @@ init_gerrit_site() {
     -v "$instance_dir/etc:/var/gerrit/etc" \
     -v "$instance_dir/logs:/var/gerrit/logs" \
     -v "$instance_dir/plugins:/var/gerrit/plugins" \
-    -e CANONICAL_WEB_URL="http://localhost:$http_port" \
+    -e CANONICAL_WEB_URL="$canonical_url" \
     "gerritcodereview/gerrit:${GERRIT_VERSION}" \
     init || {
     echo "::error::Failed to initialize Gerrit site for $slug ❌"
@@ -348,29 +349,18 @@ configure_gerrit() {
   local instance_dir="$1"
   local slug="$2"
   local http_port="$3"
+  local canonical_url="$4"
+  local listen_url="$5"
+  local api_path="$6"
+  local ssh_port="$7"
 
   echo "Configuring Gerrit for $slug..."
 
   local config_file="$instance_dir/etc/gerrit.config"
 
-  # Get API path to mirror production server's URL structure
-  local api_path
-  api_path=$(get_api_path "$slug")
-
-  # Build URLs with optional path prefix to mirror production server
-  # This allows scripts/tools to work identically against test and production
-  local canonical_url
-  local listen_url
   if [ -n "$api_path" ]; then
-    # Ensure api_path starts with / but doesn't end with /
-    api_path="/${api_path#/}"
-    api_path="${api_path%/}"
-    canonical_url="http://localhost:${http_port}${api_path}"
-    listen_url="http://*:8080${api_path}/"
     echo "  URL prefix: $api_path (mirroring production server)"
   else
-    canonical_url="http://localhost:${http_port}"
-    listen_url="http://*:8080/"
     echo "  URL prefix: (none)"
   fi
 
@@ -379,6 +369,20 @@ configure_gerrit() {
   git config -f "$config_file" gerrit.canonicalWebUrl "$canonical_url"
   git config -f "$config_file" httpd.listenUrl "$listen_url"
   git config -f "$config_file" sshd.listenAddress "*:29418"
+
+  # Configure advertised SSH address so clone URLs show correctly
+  # This tells clients what address/port to use for SSH clones
+  git config -f "$config_file" sshd.advertisedAddress "localhost:$ssh_port"
+
+  # Enable both HTTP and SSH download schemes in the web UI
+  # By default Gerrit shows SSH, HTTP, and Anonymous HTTP
+  git config -f "$config_file" download.scheme "ssh"
+  git config -f "$config_file" --add download.scheme "http"
+
+  # Configure download commands shown in the UI
+  git config -f "$config_file" download.command "checkout"
+  git config -f "$config_file" --add download.command "cherry_pick"
+  git config -f "$config_file" --add download.command "pull"
 
   # Set auth to development mode for testing
   git config -f "$config_file" auth.type "DEVELOPMENT_BECOME_ANY_ACCOUNT"
@@ -510,6 +514,25 @@ start_instance() {
   local http_port=$((BASE_HTTP_PORT + index))
   local ssh_port=$((BASE_SSH_PORT + index))
 
+  # Get API path to mirror production server's URL structure
+  # Compute this early so we can use it for both config and Docker env vars
+  local api_path
+  api_path=$(get_api_path "$slug")
+
+  # Build URLs with optional path prefix to mirror production server
+  local canonical_url
+  local listen_url
+  if [ -n "$api_path" ]; then
+    # Ensure api_path starts with / but doesn't end with /
+    api_path="/${api_path#/}"
+    api_path="${api_path%/}"
+    canonical_url="http://localhost:${http_port}${api_path}"
+    listen_url="http://*:8080${api_path}/"
+  else
+    canonical_url="http://localhost:${http_port}"
+    listen_url="http://*:8080/"
+  fi
+
   echo ""
   echo "========================================"
   echo "Instance $((index + 1)): $slug"
@@ -522,11 +545,12 @@ start_instance() {
   # Instance directory
   local instance_dir="$WORK_DIR/instances/$slug"
 
-  # Initialize site
-  init_gerrit_site "$instance_dir" "$slug" "$http_port" || return 1
+  # Initialize site (pass canonical_url for consistency)
+  init_gerrit_site "$instance_dir" "$slug" "$http_port" "$canonical_url" || return 1
 
-  # Configure Gerrit
-  configure_gerrit "$instance_dir" "$slug" "$http_port" || return 1
+  # Configure Gerrit (pass pre-computed URLs and SSH port)
+  configure_gerrit "$instance_dir" "$slug" "$http_port" \
+    "$canonical_url" "$listen_url" "$api_path" "$ssh_port" || return 1
 
   # Download and install plugins
   download_plugin "$instance_dir/plugins" || return 1
@@ -573,7 +597,11 @@ start_instance() {
     -v "$instance_dir/logs:/var/gerrit/logs"
     -v "$instance_dir/plugins:/var/gerrit/plugins"
     -v "$instance_dir/tmp:/var/gerrit/tmp"
-    -e "CANONICAL_WEB_URL=http://localhost:$http_port"
+    # Include the full URL with path prefix - the Gerrit Docker entrypoint
+    # overwrites gerrit.canonicalWebUrl from this env var on every start
+    -e "CANONICAL_WEB_URL=$canonical_url"
+    # Also set HTTPD_LISTEN_URL so the entrypoint configures the listen URL
+    -e "HTTPD_LISTEN_URL=$listen_url"
   )
 
   # Add SSH volume if using SSH auth
