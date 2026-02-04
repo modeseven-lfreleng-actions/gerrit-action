@@ -275,8 +275,7 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
       #      - Plugin check URL further below (must match listen_url path)
       #
       #   3. test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml
-      #      - NEW_CANONICAL and NEW_LISTEN in "Recreate Gerrit container" step
-      #      - Health check URL in the same step
+      #      - Tunnel inputs configure public URLs
       #
       # When USE_API_PATH is true, we use the api_path to match the production
       # server's URL structure. Otherwise, we use root (/).

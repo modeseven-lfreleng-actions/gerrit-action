@@ -352,7 +352,7 @@ configure_gerrit() {
   local canonical_url="$4"
   local listen_url="$5"
   local api_path="$6"
-  local ssh_port="$7"
+  local advertised_ssh_addr="$7"  # Format: host:port (e.g., localhost:29418 or bore.pub:12345)
 
   echo "Configuring Gerrit for $slug..."
 
@@ -372,7 +372,8 @@ configure_gerrit() {
 
   # Configure advertised SSH address so clone URLs show correctly
   # This tells clients what address/port to use for SSH clones
-  git config -f "$config_file" sshd.advertisedAddress "localhost:$ssh_port"
+  # When using tunnels, this will be the tunnel host:port (e.g., bore.pub:12345)
+  git config -f "$config_file" sshd.advertisedAddress "$advertised_ssh_addr"
 
   # Enable both HTTP and SSH download schemes in the web UI
   # By default Gerrit shows SSH, HTTP, and Anonymous HTTP
@@ -526,6 +527,28 @@ start_instance() {
     effective_api_path="$api_path"
   fi
 
+  # Check for external tunnel configuration
+  # When TUNNEL_HOST and TUNNEL_PORTS are set, use external URLs
+  local tunnel_http_port=""
+  local tunnel_ssh_port=""
+  local use_tunnel="false"
+
+  if [ -n "${TUNNEL_HOST:-}" ] && [ -n "${TUNNEL_PORTS:-}" ]; then
+    # Extract tunnel ports for this slug from JSON
+    tunnel_http_port=$(echo "$TUNNEL_PORTS" | jq -r --arg s "$slug" '.[$s].http // empty')
+    tunnel_ssh_port=$(echo "$TUNNEL_PORTS" | jq -r --arg s "$slug" '.[$s].ssh // empty')
+
+    if [ -n "$tunnel_http_port" ] && [ -n "$tunnel_ssh_port" ]; then
+      use_tunnel="true"
+      echo "  External tunnel configured: ${TUNNEL_HOST}"
+      echo "    HTTP port: $tunnel_http_port"
+      echo "    SSH port: $tunnel_ssh_port"
+    else
+      echo "  Warning: TUNNEL_HOST set but no ports found for slug '$slug'"
+      echo "  Falling back to localhost URLs"
+    fi
+  fi
+
   # Build URLs using effective_api_path (may be empty if USE_API_PATH is false)
   #
   # IMPORTANT: URL PATH CONFIGURATION - KEEP IN SYNC!
@@ -541,8 +564,7 @@ start_instance() {
   #      - Plugin check URL (must match listen_url path)
   #
   #   3. test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml
-  #      - NEW_CANONICAL and NEW_LISTEN in "Recreate Gerrit container" step
-  #      - Health check URL in the same step
+  #      - Tunnel inputs configure public URLs
   #
   # When USE_API_PATH is true and api_path is detected, the local container
   # will use the same URL structure as the production server. This ensures:
@@ -555,14 +577,34 @@ start_instance() {
   #
   local canonical_url
   local listen_url
+  local advertised_ssh_addr
+
+  # Determine the host and ports for canonical URLs
+  local url_host
+  local url_http_port
+  local url_ssh_port
+
+  if [ "$use_tunnel" = "true" ]; then
+    url_host="$TUNNEL_HOST"
+    url_http_port="$tunnel_http_port"
+    url_ssh_port="$tunnel_ssh_port"
+  else
+    url_host="localhost"
+    url_http_port="$http_port"
+    url_ssh_port="$ssh_port"
+  fi
+
+  # Build the advertised SSH address (used in clone URLs)
+  advertised_ssh_addr="${url_host}:${url_ssh_port}"
+
   if [ -n "$effective_api_path" ]; then
     # Use api_path to match production server structure
-    canonical_url="http://localhost:${http_port}${effective_api_path}/"
+    canonical_url="http://${url_host}:${url_http_port}${effective_api_path}/"
     listen_url="http://*:8080${effective_api_path}/"
     echo "  Using API path: $effective_api_path (USE_API_PATH=true)"
   else
     # No api_path - serve at root
-    canonical_url="http://localhost:${http_port}/"
+    canonical_url="http://${url_host}:${url_http_port}/"
     listen_url="http://*:8080/"
     if [ -n "$api_path" ]; then
       echo "  API path detected ($api_path) but USE_API_PATH is false"
@@ -571,16 +613,29 @@ start_instance() {
   fi
 
   # Export for use by other steps (e.g., bore tunnel config updates)
-  echo "GERRIT_CANONICAL_URL=$canonical_url" >> "$WORK_DIR/env.sh"
-  echo "GERRIT_LISTEN_URL=$listen_url" >> "$WORK_DIR/env.sh"
+  {
+    echo "GERRIT_CANONICAL_URL=$canonical_url"
+    echo "GERRIT_LISTEN_URL=$listen_url"
+    echo "GERRIT_SSH_ADDR=$advertised_ssh_addr"
+    if [ "$use_tunnel" = "true" ]; then
+      echo "GERRIT_TUNNEL_MODE=true"
+    fi
+  } >> "$WORK_DIR/env.sh"
 
   echo ""
   echo "========================================"
   echo "Instance $((index + 1)): $slug"
   echo "  Project: $project"
   echo "  Source: $gerrit_host"
-  echo "  HTTP Port: $http_port"
-  echo "  SSH Port: $ssh_port"
+  echo "  Local HTTP Port: $http_port"
+  echo "  Local SSH Port: $ssh_port"
+  if [ "$use_tunnel" = "true" ]; then
+    echo "  Tunnel Mode: ENABLED"
+    echo "  Public URL: $canonical_url"
+    echo "  Public SSH: $advertised_ssh_addr"
+  else
+    echo "  Tunnel Mode: disabled (localhost)"
+  fi
   echo "========================================"
 
   # Instance directory
@@ -589,9 +644,9 @@ start_instance() {
   # Initialize site (pass canonical_url for consistency)
   init_gerrit_site "$instance_dir" "$slug" "$http_port" "$canonical_url" || return 1
 
-  # Configure Gerrit (pass pre-computed URLs and SSH port)
+  # Configure Gerrit (pass pre-computed URLs and advertised SSH address)
   configure_gerrit "$instance_dir" "$slug" "$http_port" \
-    "$canonical_url" "$listen_url" "$api_path" "$ssh_port" || return 1
+    "$canonical_url" "$listen_url" "$api_path" "$advertised_ssh_addr" || return 1
 
   # Download and install plugins
   download_plugin "$instance_dir/plugins" || return 1
