@@ -84,7 +84,7 @@ create_gerrit_account() {
     docker exec "$cid" bash -c '
       cd /tmp/account-setup
       rm -rf account-repo
-      git init account-repo
+      git init -q --initial-branch=main account-repo
       cd account-repo
 
       git config user.email "'"$email"'"
@@ -108,7 +108,7 @@ create_gerrit_account() {
     docker exec "$cid" bash -c '
       cd /tmp/account-setup
       rm -rf account-repo
-      git init account-repo
+      git init -q --initial-branch=main account-repo
       cd account-repo
 
       git config user.email "'"$email"'"
@@ -153,7 +153,7 @@ register_external_id() {
 set -e
 cd /tmp/account-setup
 rm -rf accounts-repo
-git init accounts-repo
+git init -q --initial-branch=main accounts-repo
 cd accounts-repo
 
 git config user.email "$email"
@@ -210,7 +210,7 @@ USERNAME="$2"
 
 cd /tmp/account-setup
 rm -rf admin-group-repo
-git init admin-group-repo
+git init -q --initial-branch=main admin-group-repo
 cd admin-group-repo
 
 git config user.email "gerrit@localhost"
@@ -246,7 +246,7 @@ GROUP_REF="refs/groups/$SHARD/$ADMIN_UUID"
 
 cd /tmp/account-setup
 rm -rf group-members-repo
-git init group-members-repo
+git init -q --initial-branch=main group-members-repo
 cd group-members-repo
 
 git config user.email "gerrit@localhost"
