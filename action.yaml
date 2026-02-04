@@ -161,9 +161,10 @@ inputs:
     description: |
       SSH public keys to add for accessing the Gerrit container.
       One key per line, in standard authorized_keys format.
-      These keys will be added to an admin account (ID 1000000)
-      allowing SSH access to the Gerrit container for debugging
-      or automation purposes.
+
+      When ssh_auth_username is also provided, a new Gerrit user
+      account will be created with that username and these keys.
+      Otherwise, keys are added to the default admin account.
 
       Example:
         ssh_auth_keys: |
@@ -171,9 +172,25 @@ inputs:
           ecdsa-sha2-nistp256 AAAAE2... another@example.com
     required: false
     default: ''
+  ssh_auth_username:
+    description: |
+      Gerrit username to create for SSH access.
+      When provided along with ssh_auth_keys, a new Gerrit user
+      account will be created with this username and the provided
+      SSH public keys.
+
+      If not provided, ssh_auth_keys will be added to the default
+      admin account (ID 1000000).
+
+      Example:
+        ssh_auth_username: 'myusername'
+    required: false
+    default: ''
   tunnel_host:
     description: |
-      External tunnel hostname for public access (e.g., 'bore.pub').
+      External tunnel hostname for public access.
+      Examples: 'bore.pub', Tailscale IP (e.g., '100.x.y.z').
+
       When set along with tunnel_ports, Gerrit will be configured with
       external URLs for canonicalWebUrl and sshd.advertisedAddress.
 
@@ -190,7 +207,7 @@ inputs:
       For single-instance setups, use the slug from gerrit_setup.
       The ports are the remote/public ports assigned by the tunnel service.
 
-      Example for bore.pub:
+      Example:
         tunnel_ports: '{"lf-gerrit": {"http": 45678, "ssh": 45679}}'
     required: false
     default: ''
@@ -425,6 +442,7 @@ runs:
       shell: bash
       env:
         SSH_AUTH_KEYS: ${{ inputs.ssh_auth_keys }}
+        SSH_AUTH_USERNAME: ${{ inputs.ssh_auth_username }}
         DEBUG: ${{ inputs.debug }}
       run: |
         # Add SSH authentication keys for user access

@@ -3,8 +3,11 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 # Add SSH authentication keys to Gerrit container
-# This script adds SSH public keys to a Gerrit admin account, allowing
+# This script adds SSH public keys to a Gerrit user account, allowing
 # external SSH access to the Gerrit container for debugging or automation.
+#
+# When SSH_AUTH_USERNAME is provided, a new user account is created.
+# Otherwise, keys are added to the default admin account.
 
 set -euo pipefail
 
@@ -16,9 +19,25 @@ fi
 
 echo "Adding SSH authentication keys to Gerrit container(s)..."
 
-# Gerrit admin account ID (created automatically in DEVELOPMENT_BECOME_ANY_ACCOUNT mode)
-ADMIN_ACCOUNT_ID="1000000"
-ADMIN_USERNAME="admin"
+# Determine account configuration
+# If SSH_AUTH_USERNAME is provided, create a new account with that username
+# Otherwise, use the default admin account
+if [ -n "${SSH_AUTH_USERNAME:-}" ]; then
+  # Custom username provided - create a new account
+  # Use account ID 1000001+ for custom users (1000000 is reserved for admin)
+  ACCOUNT_ID="1000001"
+  USERNAME="$SSH_AUTH_USERNAME"
+  FULL_NAME="$SSH_AUTH_USERNAME"
+  EMAIL="${SSH_AUTH_USERNAME}@gerrit.local"
+  echo "Creating custom Gerrit user: $USERNAME (account ID: $ACCOUNT_ID)"
+else
+  # Default admin account
+  ACCOUNT_ID="1000000"
+  USERNAME="admin"
+  FULL_NAME="Administrator"
+  EMAIL="admin@example.com"
+  echo "Using default admin account (ID: $ACCOUNT_ID)"
+fi
 
 # Read instances from the tracking file
 INSTANCES_JSON_FILE="$WORK_DIR/instances.json"
@@ -27,6 +46,295 @@ if [ ! -f "$INSTANCES_JSON_FILE" ]; then
   echo "::error::Instances file not found: $INSTANCES_JSON_FILE"
   exit 1
 fi
+
+# Function to create or update a Gerrit account with SSH keys
+create_gerrit_account() {
+  local cid="$1"
+  local account_id="$2"
+  local username="$3"
+  local full_name="$4"
+  local email="$5"
+
+  # Calculate account ref shard (last 2 digits of account ID)
+  local account_shard
+  account_shard=$(printf "%02d" $((account_id % 100)))
+  local account_ref="refs/users/${account_shard}/${account_id}"
+
+  echo "  Creating/updating account at $account_ref..."
+
+  # Create a temporary directory for git operations
+  docker exec "$cid" mkdir -p /tmp/account-setup
+
+  # Write the SSH keys to a temporary file on the host
+  local keys_tmpfile
+  keys_tmpfile=$(mktemp)
+  echo "$SSH_AUTH_KEYS" > "$keys_tmpfile"
+
+  # Copy the keys file into the container
+  docker cp "$keys_tmpfile" "$cid:/tmp/authorized_keys_input"
+  rm -f "$keys_tmpfile"
+
+  # Check if the ref already exists
+  local ref_exists
+  ref_exists=$(docker exec "$cid" git -C /var/gerrit/git/All-Users.git \
+    show-ref "$account_ref" 2>/dev/null || echo "")
+
+  if [ -n "$ref_exists" ]; then
+    echo "  Account ref already exists, updating SSH keys..."
+    docker exec "$cid" bash -c '
+      cd /tmp/account-setup
+      rm -rf account-repo
+      git init account-repo
+      cd account-repo
+
+      git config user.email "'"$email"'"
+      git config user.name "'"$full_name"'"
+
+      # Fetch existing account ref
+      git fetch /var/gerrit/git/All-Users.git '"'$account_ref'"':existing
+      git checkout existing
+
+      # Update authorized_keys from the input file
+      cp /tmp/authorized_keys_input authorized_keys
+
+      git add authorized_keys
+      git commit -m "Update SSH authorized keys for '"$username"'" --allow-empty
+
+      # Push back
+      git push /var/gerrit/git/All-Users.git HEAD:'"'$account_ref'"'
+    '
+  else
+    echo "  Creating new account ref..."
+    docker exec "$cid" bash -c '
+      cd /tmp/account-setup
+      rm -rf account-repo
+      git init account-repo
+      cd account-repo
+
+      git config user.email "'"$email"'"
+      git config user.name "'"$full_name"'"
+
+      # Create account.config
+      cat > account.config <<EOF
+[account]
+  fullName = '"$full_name"'
+  preferredEmail = '"$email"'
+  active = true
+EOF
+
+      # Copy the authorized_keys from the input file
+      cp /tmp/authorized_keys_input authorized_keys
+
+      # Add and commit
+      git add account.config authorized_keys
+      git commit -m "Create account '"$username"' with SSH keys"
+
+      # Push to All-Users repository
+      git push /var/gerrit/git/All-Users.git HEAD:'"'$account_ref'"'
+    '
+  fi
+}
+
+# Function to register external ID for a username
+register_external_id() {
+  local cid="$1"
+  local account_id="$2"
+  local username="$3"
+  local full_name="$4"
+  local email="$5"
+
+  echo "  Registering external ID for username: $username..."
+
+  # Create the external-ids script
+  local extid_script
+  extid_script=$(mktemp)
+  cat > "$extid_script" << EXTID_SCRIPT_EOF
+#!/bin/bash
+set -e
+cd /tmp/account-setup
+rm -rf accounts-repo
+git init accounts-repo
+cd accounts-repo
+
+git config user.email "$email"
+git config user.name "$full_name"
+
+# Try to fetch existing external-ids ref
+if git fetch /var/gerrit/git/All-Users.git refs/meta/external-ids:external-ids 2>/dev/null; then
+  git checkout external-ids
+else
+  # Create new external-ids tracking
+  git checkout --orphan external-ids
+  git rm -rf . 2>/dev/null || true
+fi
+
+# Create external ID file for username
+EXTERNAL_ID_FILE="username:$username"
+EXTERNAL_ID_HASH=\$(echo -n "\$EXTERNAL_ID_FILE" | sha1sum | cut -d' ' -f1)
+EXTERNAL_ID_SHARD="\${EXTERNAL_ID_HASH:0:2}"
+
+mkdir -p "\$EXTERNAL_ID_SHARD"
+cat > "\$EXTERNAL_ID_SHARD/\$EXTERNAL_ID_HASH" <<EOF
+[externalId "username:$username"]
+  accountId = $account_id
+EOF
+
+git add .
+git commit -m "Add external ID for $username" --allow-empty
+
+git push /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids 2>/dev/null || true
+EXTID_SCRIPT_EOF
+
+  docker cp "$extid_script" "$cid:/tmp/register-external-ids.sh"
+  rm -f "$extid_script"
+  docker exec "$cid" bash /tmp/register-external-ids.sh
+}
+
+# Function to add user to Administrators group for full permissions
+add_to_administrators_group() {
+  local cid="$1"
+  local account_id="$2"
+  local username="$3"
+
+  echo "  Adding user '$username' to Administrators group..."
+
+  # Create the script to add user to Administrators group
+  local admin_script
+  admin_script=$(mktemp)
+  cat > "$admin_script" << 'ADMIN_SCRIPT_EOF'
+#!/bin/bash
+set -e
+
+ACCOUNT_ID="$1"
+USERNAME="$2"
+
+cd /tmp/account-setup
+rm -rf admin-group-repo
+git init admin-group-repo
+cd admin-group-repo
+
+git config user.email "gerrit@localhost"
+git config user.name "Gerrit System"
+
+# First, find the Administrators group UUID from group-names ref
+if ! git fetch /var/gerrit/git/All-Users.git refs/meta/group-names:group-names 2>/dev/null; then
+  echo "Warning: Could not fetch group-names ref"
+  exit 0
+fi
+
+git checkout group-names
+
+# Find the Administrators group file (it's named after the UUID)
+ADMIN_UUID=""
+for f in *; do
+  if [ -f "$f" ] && grep -q "name = Administrators" "$f" 2>/dev/null; then
+    ADMIN_UUID="$f"
+    break
+  fi
+done
+
+if [ -z "$ADMIN_UUID" ]; then
+  echo "Warning: Could not find Administrators group UUID"
+  exit 0
+fi
+
+echo "Found Administrators group UUID: $ADMIN_UUID"
+
+# Now fetch the group ref and add the user
+SHARD="${ADMIN_UUID:0:2}"
+GROUP_REF="refs/groups/$SHARD/$ADMIN_UUID"
+
+cd /tmp/account-setup
+rm -rf group-members-repo
+git init group-members-repo
+cd group-members-repo
+
+git config user.email "gerrit@localhost"
+git config user.name "Gerrit System"
+
+if git fetch /var/gerrit/git/All-Users.git "$GROUP_REF":group-ref 2>/dev/null; then
+  git checkout group-ref
+else
+  # Group ref doesn't exist yet, create it
+  git checkout --orphan group-ref
+  git rm -rf . 2>/dev/null || true
+  # Create group.config
+  cat > group.config <<EOF
+[group]
+  name = Administrators
+  visibleToAll = false
+EOF
+  touch members
+fi
+
+# Check if account is already a member
+if grep -q "^${ACCOUNT_ID}$" members 2>/dev/null; then
+  echo "Account $ACCOUNT_ID is already a member of Administrators"
+  exit 0
+fi
+
+# Add the account ID to members file
+echo "$ACCOUNT_ID" >> members
+
+# Sort and deduplicate
+sort -u members -o members
+
+git add .
+git commit -m "Add $USERNAME (account $ACCOUNT_ID) to Administrators group" --allow-empty
+
+git push /var/gerrit/git/All-Users.git HEAD:"$GROUP_REF"
+
+echo "Successfully added $USERNAME to Administrators group"
+ADMIN_SCRIPT_EOF
+
+  docker cp "$admin_script" "$cid:/tmp/add-to-admin-group.sh"
+  rm -f "$admin_script"
+  docker exec "$cid" bash /tmp/add-to-admin-group.sh "$account_id" "$username" || true
+}
+
+# Function to flush Gerrit caches
+flush_caches() {
+  local cid="$1"
+
+  echo "  Reloading Gerrit caches..."
+
+  docker exec "$cid" bash -c '
+    # Wait a moment for Gerrit to be ready
+    sleep 2
+
+    # Try to flush caches using the Gerrit SSH interface locally
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -p 29418 \
+        -i /var/gerrit/.ssh/id_rsa \
+        admin@localhost \
+        gerrit flush-caches --cache accounts 2>/dev/null || true
+
+    # Also flush external IDs cache
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -p 29418 \
+        -i /var/gerrit/.ssh/id_rsa \
+        admin@localhost \
+        gerrit flush-caches --cache external_ids 2>/dev/null || true
+
+    # Flush groups cache
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -p 29418 \
+        -i /var/gerrit/.ssh/id_rsa \
+        admin@localhost \
+        gerrit flush-caches --cache groups 2>/dev/null || true
+
+    # Flush groups_byuuid cache
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -p 29418 \
+        -i /var/gerrit/.ssh/id_rsa \
+        admin@localhost \
+        gerrit flush-caches --cache groups_byuuid 2>/dev/null || true
+  ' || true
+}
 
 # Process each instance
 for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
@@ -41,162 +349,41 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
 
   echo "  Container ID: $cid"
 
-  # Create the admin account in All-Users repository
-  # Gerrit stores accounts in refs/users/XX/ACCOUNTID where XX is the last 2 digits
-  ACCOUNT_SHARD=$(printf "%02d" $((ADMIN_ACCOUNT_ID % 100)))
-  ACCOUNT_REF="refs/users/${ACCOUNT_SHARD}/${ADMIN_ACCOUNT_ID}"
+  # Create or update the account
+  create_gerrit_account "$cid" "$ACCOUNT_ID" "$USERNAME" "$FULL_NAME" "$EMAIL"
 
-  echo "  Creating admin account at $ACCOUNT_REF..."
+  # Register external ID
+  register_external_id "$cid" "$ACCOUNT_ID" "$USERNAME" "$FULL_NAME" "$EMAIL"
 
-  # Create a temporary directory for git operations
-  docker exec "$cid" mkdir -p /tmp/account-setup
+  # Add user to Administrators group for full create/merge permissions
+  add_to_administrators_group "$cid" "$ACCOUNT_ID" "$USERNAME"
 
-  # Write the SSH keys to a temporary file on the host
-  KEYS_TMPFILE=$(mktemp)
-  echo "$SSH_AUTH_KEYS" > "$KEYS_TMPFILE"
-
-  # Copy the keys file into the container
-  docker cp "$KEYS_TMPFILE" "$cid:/tmp/authorized_keys_input"
-  rm -f "$KEYS_TMPFILE"
-
-  # Initialize a bare repo for the account ref
-  docker exec "$cid" bash -c '
-    cd /tmp/account-setup
-    rm -rf account-repo
-    git init account-repo
-    cd account-repo
-
-    # Configure git
-    git config user.email "admin@example.com"
-    git config user.name "Administrator"
-
-    # Create account.config
-    cat > account.config <<EOF
-[account]
-  fullName = Administrator
-  preferredEmail = admin@example.com
-  active = true
-EOF
-
-    # Copy the authorized_keys from the input file
-    cp /tmp/authorized_keys_input authorized_keys
-
-    # Add and commit
-    git add account.config authorized_keys
-    git commit -m "Create admin account with SSH keys"
-  '
-
-  # Push to All-Users repository
-  # First, check if the ref already exists
-  REF_EXISTS=$(docker exec "$cid" git -C /var/gerrit/git/All-Users.git \
-    show-ref "$ACCOUNT_REF" 2>/dev/null || echo "")
-
-  if [ -n "$REF_EXISTS" ]; then
-    echo "  Account ref already exists, updating..."
-    # Fetch the existing ref, update it, and push
-    docker exec "$cid" bash -c '
-      cd /tmp/account-setup/account-repo
-      git fetch /var/gerrit/git/All-Users.git '"'$ACCOUNT_REF'"':existing
-      git checkout existing
-
-      # Update authorized_keys from the input file
-      cp /tmp/authorized_keys_input authorized_keys
-
-      git add authorized_keys
-      git commit -m "Update SSH authorized keys" --allow-empty
-
-      # Push back
-      git push /var/gerrit/git/All-Users.git HEAD:'"'$ACCOUNT_REF'"'
-    '
-  else
-    echo "  Creating new account ref..."
-    docker exec "$cid" bash -c '
-      cd /tmp/account-setup/account-repo
-      git push /var/gerrit/git/All-Users.git HEAD:'"'$ACCOUNT_REF'"'
-    '
-  fi
-
-  # Also need to add the account to the accounts ref (refs/meta/accounts)
-  # This registers the account ID -> external ID mapping
-  echo "  Registering account in accounts index..."
-
-  # Create the external-ids script on the host and copy it to the container
-  EXTID_SCRIPT=$(mktemp)
-  cat > "$EXTID_SCRIPT" << 'EXTID_SCRIPT_EOF'
-#!/bin/bash
-set -e
-cd /tmp/account-setup
-rm -rf accounts-repo
-git init accounts-repo
-cd accounts-repo
-
-git config user.email "admin@example.com"
-git config user.name "Administrator"
-
-# Try to fetch existing accounts ref
-if git fetch /var/gerrit/git/All-Users.git refs/meta/external-ids:external-ids 2>/dev/null; then
-  git checkout external-ids
-else
-  # Create new external-ids tracking
-  git checkout --orphan external-ids
-  git rm -rf . 2>/dev/null || true
-fi
-
-# Create external ID file for username
-# External ID format: username:admin -> account 1000000
-EXTERNAL_ID_FILE="username:admin"
-EXTERNAL_ID_HASH=$(echo -n "$EXTERNAL_ID_FILE" | sha1sum | cut -d' ' -f1)
-EXTERNAL_ID_SHARD="${EXTERNAL_ID_HASH:0:2}"
-
-mkdir -p "$EXTERNAL_ID_SHARD"
-cat > "$EXTERNAL_ID_SHARD/$EXTERNAL_ID_HASH" <<EOF
-[externalId "username:admin"]
-  accountId = 1000000
-EOF
-
-git add .
-git commit -m "Add admin external ID" --allow-empty
-
-git push /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids 2>/dev/null || true
-EXTID_SCRIPT_EOF
-
-  docker cp "$EXTID_SCRIPT" "$cid:/tmp/register-external-ids.sh"
-  rm -f "$EXTID_SCRIPT"
-  docker exec "$cid" bash /tmp/register-external-ids.sh
-
-  # Reload the account cache
-  echo "  Reloading Gerrit caches..."
-
-  # Try to flush caches via SSH (may not work if SSH isn't ready yet)
-  docker exec "$cid" bash -c '
-    # Wait a moment for Gerrit to be ready
-    sleep 2
-
-    # Try to flush caches using the Gerrit SSH interface locally
-    # This requires the container internal SSH to be ready
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -p 29418 \
-        -i /var/gerrit/.ssh/id_rsa \
-        admin@localhost \
-        gerrit flush-caches --cache accounts 2>/dev/null || true
-  ' || true
+  # Flush caches
+  flush_caches "$cid"
 
   # Clean up
-  docker exec "$cid" rm -rf /tmp/account-setup /tmp/authorized_keys_input
+  docker exec "$cid" rm -rf /tmp/account-setup /tmp/authorized_keys_input 2>/dev/null || true
 
-  echo "  SSH keys added for $slug ✅"
+  echo "  SSH keys added ✅"
 
   # Display the keys that were added
   KEY_COUNT=$(echo "$SSH_AUTH_KEYS" | grep -c '^[a-z]' || echo "0")
-  echo "  Added $KEY_COUNT SSH public key(s)"
+  echo "  Added $KEY_COUNT SSH public key(s) for user '$USERNAME'"
+  if [ -n "${SSH_AUTH_USERNAME:-}" ]; then
+    echo "  User added to Administrators group (create/merge permissions)"
+  fi
 done
 
 echo ""
 echo "SSH authentication keys configured ✅"
 echo ""
-echo "You can now SSH to the Gerrit container(s) as '$ADMIN_USERNAME'"
-echo "Example: ssh -p <port> $ADMIN_USERNAME@<host>"
+echo "You can now SSH to the Gerrit container(s) as '$USERNAME'"
+echo "Example: ssh -p <port> $USERNAME@<host>"
+if [ -n "${SSH_AUTH_USERNAME:-}" ]; then
+  echo ""
+  echo "User '$USERNAME' has been added to the Administrators group."
+  echo "This grants full permissions to create and merge changes."
+fi
 
 # Add to step summary
 {
@@ -204,7 +391,16 @@ echo "Example: ssh -p <port> $ADMIN_USERNAME@<host>"
   echo ""
   echo "SSH public keys have been added to the Gerrit container(s)."
   echo ""
-  echo "**Username:** \`$ADMIN_USERNAME\`"
+  echo "**Username:** \`$USERNAME\`"
+  if [ -n "${SSH_AUTH_USERNAME:-}" ]; then
+    echo ""
+    echo "**Account:** Custom user account created (ID: $ACCOUNT_ID)"
+    echo ""
+    echo "**Group:** Added to Administrators (full create/merge permissions)"
+  else
+    echo ""
+    echo "**Account:** Default admin account (ID: $ACCOUNT_ID)"
+  fi
   echo ""
   echo "**Keys added:**"
   echo '```'

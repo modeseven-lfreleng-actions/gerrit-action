@@ -352,7 +352,7 @@ configure_gerrit() {
   local canonical_url="$4"
   local listen_url="$5"
   local api_path="$6"
-  local advertised_ssh_addr="$7"  # Format: host:port (e.g., localhost:29418 or bore.pub:12345)
+  local advertised_ssh_addr="$7"  # Format: host:port (e.g., localhost:29418 or tunnel:12345)
 
   echo "Configuring Gerrit for $slug..."
 
@@ -372,7 +372,7 @@ configure_gerrit() {
 
   # Configure advertised SSH address so clone URLs show correctly
   # This tells clients what address/port to use for SSH clones
-  # When using tunnels, this will be the tunnel host:port (e.g., bore.pub:12345)
+  # When using tunnels, this will be the tunnel host:port
   git config -f "$config_file" sshd.advertisedAddress "$advertised_ssh_addr"
 
   # Enable both HTTP and SSH download schemes in the web UI
@@ -563,7 +563,7 @@ start_instance() {
   #      - HEALTH_URL construction (must match listen_url path)
   #      - Plugin check URL (must match listen_url path)
   #
-  #   3. test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml
+  #   3. test-gerrit-servers/.github/workflows/ (tunnel workflow)
   #      - Tunnel inputs configure public URLs
   #
   # When USE_API_PATH is true and api_path is detected, the local container
@@ -612,7 +612,7 @@ start_instance() {
     fi
   fi
 
-  # Export for use by other steps (e.g., bore tunnel config updates)
+  # Export for use by other steps (e.g., tunnel config updates)
   {
     echo "GERRIT_CANONICAL_URL=$canonical_url"
     echo "GERRIT_LISTEN_URL=$listen_url"

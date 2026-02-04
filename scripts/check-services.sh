@@ -274,7 +274,7 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
       #      - HEALTH_URL construction below (must match listen_url path)
       #      - Plugin check URL further below (must match listen_url path)
       #
-      #   3. test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml
+      #   3. test-gerrit-servers/.github/workflows/ (tunnel workflow)
       #      - Tunnel inputs configure public URLs
       #
       # When USE_API_PATH is true, we use the api_path to match the production

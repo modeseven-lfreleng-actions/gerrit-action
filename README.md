@@ -82,14 +82,15 @@ Use this action in CI/CD pipelines that need to:
 
 <!-- markdownlint-disable MD013 -->
 
-| Name            | Required | Default | Description                                                      |
-| --------------- | -------- | ------- | ---------------------------------------------------------------- |
-| ssh_private_key | False    |         | SSH private key for authentication (required if `auth_type=ssh`) |
-| ssh_known_hosts | False    | auto    | SSH known_hosts entries (auto-generated if not provided)         |
-| ssh_auth_keys   | False    |         | SSH public keys to add for container access (one key per line)   |
-| http_username   | False    |         | HTTP basic auth username (required if `auth_type=http_basic`)    |
-| http_password   | False    |         | HTTP basic auth password (required if `auth_type=http_basic`)    |
-| bearer_token    | False    |         | Bearer token (required if `auth_type=bearer_token`)              |
+| Name              | Required | Default | Description                                                      |
+| ----------------- | -------- | ------- | ---------------------------------------------------------------- |
+| ssh_private_key   | False    |         | SSH private key for authentication (required if `auth_type=ssh`) |
+| ssh_known_hosts   | False    | auto    | SSH known_hosts entries (auto-generated if not provided)         |
+| ssh_auth_keys     | False    |         | SSH public keys to add for container access (one key per line)   |
+| ssh_auth_username | False    |         | Gerrit username to create for SSH access (uses admin if omitted) |
+| http_username     | False    |         | HTTP basic auth username (required if `auth_type=http_basic`)    |
+| http_password     | False    |         | HTTP basic auth password (required if `auth_type=http_basic`)    |
+| bearer_token      | False    |         | Bearer token (required if `auth_type=bearer_token`)              |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -156,16 +157,18 @@ These inputs configure Gerrit with public tunnel URLs for remote access.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name         | Required | Default | Description                                                                                          |
-| ------------ | -------- | ------- | ---------------------------------------------------------------------------------------------------- |
-| tunnel_host  | False    |         | External tunnel hostname (e.g., `bore.pub`). Used for `canonicalWebUrl` and `sshd.advertisedAddress` |
-| tunnel_ports | False    |         | JSON mapping slugs to tunnel ports: `{"slug": {"http": 12345, "ssh": 54321}}`                        |
+| Name         | Required | Default | Description                                                                                                        |
+| ------------ | -------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| tunnel_host  | False    |         | External tunnel hostname (e.g., `bore.pub`, Tailscale IP). Used for `canonicalWebUrl` and `sshd.advertisedAddress` |
+| tunnel_ports | False    |         | JSON mapping slugs to tunnel ports: `{"slug": {"http": 12345, "ssh": 54321}}`                                      |
 
 <!-- markdownlint-enable MD013 -->
 
 > **Note:** When using tunnels, start the tunnel *before* invoking this action.
-> Tools like [bore](https://github.com/ekzhang/bore) don't require the local
-> port to be listening—they connect on-demand when traffic arrives.
+> Some tunnel tools (like [bore](https://github.com/ekzhang/bore)) don't require
+> the local port to be listening—they connect on-demand when traffic arrives.
+> Other tunnels (like [Tailscale](https://tailscale.com)) provide a stable IP
+> that can be used directly with the local ports.
 
 ## Outputs
 
@@ -367,11 +370,12 @@ steps:
         https://example.com/plugins/another-plugin.jar
 ```
 
-### Example 8: Public Access via Bore Tunnel
+### Example 8: Public Access via External Tunnel (Bore)
 
-This example shows how to expose Gerrit publicly using
-[bore](https://github.com/ekzhang/bore) tunnels. Bore tunnels can be started
-before Gerrit since they connect on-demand when traffic arrives.
+This example shows how to expose Gerrit publicly using an external tunnel.
+The example uses [bore](https://github.com/ekzhang/bore), but other tunnel
+methods like [Tailscale](https://tailscale.com) can also be used.
+Bore tunnels can be started before Gerrit since they connect on-demand.
 
 <!-- markdownlint-disable MD013 -->
 
@@ -443,9 +447,9 @@ steps:
 
 <!-- markdownlint-enable MD013 -->
 
-> **Real-world example:** See
-> [`test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml`](../test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml)
-> for a complete working implementation.
+> **Real-world example:** See the tunnel workflow in
+> [`test-gerrit-servers/.github/workflows/`](../test-gerrit-servers/.github/workflows/)
+> for a complete working implementation with multiple tunnel options.
 
 ## Using Repository Variables
 
