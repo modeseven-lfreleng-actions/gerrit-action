@@ -171,6 +171,29 @@ inputs:
           ecdsa-sha2-nistp256 AAAAE2... another@example.com
     required: false
     default: ''
+  tunnel_host:
+    description: |
+      External tunnel hostname for public access (e.g., 'bore.pub').
+      When set along with tunnel_ports, Gerrit will be configured with
+      external URLs for canonicalWebUrl and sshd.advertisedAddress.
+
+      The tunnel should be started before invoking this action, pointing
+      to the local ports (base_http_port, base_ssh_port).
+    required: false
+    default: ''
+  tunnel_ports:
+    description: |
+      JSON object mapping instance slugs to their tunnel port assignments.
+      Required when tunnel_host is set. Format:
+        {"slug": {"http": 12345, "ssh": 54321}, ...}
+
+      For single-instance setups, use the slug from gerrit_setup.
+      The ports are the remote/public ports assigned by the tunnel service.
+
+      Example for bore.pub:
+        tunnel_ports: '{"lf-gerrit": {"http": 45678, "ssh": 45679}}'
+    required: false
+    default: ''
 
 outputs:
   container_ids:
@@ -375,6 +398,8 @@ runs:
         GERRIT_INIT_ARGS: ${{ inputs.gerrit_init_args }}
         DEBUG: ${{ inputs.debug }}
         USE_API_PATH: ${{ inputs.use_api_path }}
+        TUNNEL_HOST: ${{ inputs.tunnel_host }}
+        TUNNEL_PORTS: ${{ inputs.tunnel_ports }}
       run: |
         # Start Gerrit instances
         set -euo pipefail

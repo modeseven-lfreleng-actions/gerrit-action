@@ -86,6 +86,7 @@ Use this action in CI/CD pipelines that need to:
 | --------------- | -------- | ------- | ---------------------------------------------------------------- |
 | ssh_private_key | False    |         | SSH private key for authentication (required if `auth_type=ssh`) |
 | ssh_known_hosts | False    | auto    | SSH known_hosts entries (auto-generated if not provided)         |
+| ssh_auth_keys   | False    |         | SSH public keys to add for container access (one key per line)   |
 | http_username   | False    |         | HTTP basic auth username (required if `auth_type=http_basic`)    |
 | http_password   | False    |         | HTTP basic auth password (required if `auth_type=http_basic`)    |
 | bearer_token    | False    |         | Bearer token (required if `auth_type=bearer_token`)              |
@@ -110,12 +111,15 @@ Use this action in CI/CD pipelines that need to:
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                | Required | Default | Description                                                       |
-| ------------------- | -------- | ------- | ----------------------------------------------------------------- |
-| sync_on_startup     | False    | `true`  | Trigger replication after startup                                 |
-| replication_timeout | False    | `600`   | Timeout for initial replication sync (seconds)                    |
-| sync_refs           | False    | (all)   | Comma-separated refs to sync (e.g., `+refs/heads/*:refs/heads/*`) |
-| replication_threads | False    | `4`     | Number of replication threads per instance                        |
+| Name                        | Required | Default | Description                                                                |
+| --------------------------- | -------- | ------- | -------------------------------------------------------------------------- |
+| sync_on_startup             | False    | `true`  | Trigger replication after startup                                          |
+| fetch_every                 | False    | `60s`   | Interval for pull-replication polling (e.g., `60s`, `5m`, `0s` to disable) |
+| replication_timeout         | False    | `600`   | Timeout for initial replication sync (seconds)                             |
+| replication_wait_timeout    | False    | `300`   | Max time to wait for replication before verification (seconds)             |
+| require_replication_success | False    | `true`  | Fail workflow if replication verification fails                            |
+| sync_refs                   | False    | (all)   | Comma-separated refs to sync (e.g., `+refs/heads/*:refs/heads/*`)          |
+| replication_threads         | False    | `4`     | Number of replication threads per instance                                 |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -136,25 +140,45 @@ Use this action in CI/CD pipelines that need to:
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                | Required | Default | Description                                          |
-| ------------------- | -------- | ------- | ---------------------------------------------------- |
-| debug               | False    | `false` | Enable debugging output                              |
-| additional_plugins  | False    |         | Comma-separated list of extra plugin URLs to install |
-| gerrit_init_args    | False    |         | Extra arguments for `gerrit.war init`                |
-| skip_plugin_install | False    | `false` | Skip pull-replication plugin installation (testing)  |
+| Name                | Required | Default | Description                                                             |
+| ------------------- | -------- | ------- | ----------------------------------------------------------------------- |
+| debug               | False    | `false` | Enable debugging output                                                 |
+| use_api_path        | False    | `false` | Use source server's URL path (e.g., `/r`, `/infra`) for local container |
+| additional_plugins  | False    |         | Comma-separated list of extra plugin URLs to install                    |
+| gerrit_init_args    | False    |         | Extra arguments for `gerrit.war init`                                   |
+| skip_plugin_install | False    | `false` | Skip pull-replication plugin installation (testing)                     |
 
 <!-- markdownlint-enable MD013 -->
+
+### External Tunnel Configuration
+
+These inputs configure Gerrit with public tunnel URLs for remote access.
+
+<!-- markdownlint-disable MD013 -->
+
+| Name         | Required | Default | Description                                                                                          |
+| ------------ | -------- | ------- | ---------------------------------------------------------------------------------------------------- |
+| tunnel_host  | False    |         | External tunnel hostname (e.g., `bore.pub`). Used for `canonicalWebUrl` and `sshd.advertisedAddress` |
+| tunnel_ports | False    |         | JSON mapping slugs to tunnel ports: `{"slug": {"http": 12345, "ssh": 54321}}`                        |
+
+<!-- markdownlint-enable MD013 -->
+
+> **Note:** When using tunnels, start the tunnel *before* invoking this action.
+> Tools like [bore](https://github.com/ekzhang/bore) don't require the local
+> port to be listening—they connect on-demand when traffic arrives.
 
 ## Outputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Name          | Description                                  | Example                                         |
-| ------------- | -------------------------------------------- | ----------------------------------------------- |
-| container_ids | JSON array of running container IDs          | `["abc123", "def456"]`                          |
-| container_ips | JSON array of container IP addresses         | `["172.17.0.2", "172.17.0.3"]`                  |
-| instances     | JSON object mapping slug to instance details | See [Instances Output](#instances-output)       |
-| gerrit_urls   | Comma-separated list of Gerrit HTTP URLs     | `http://172.17.0.2:8080,http://172.17.0.3:8080` |
+| Name          | Description                                  | Example                                          |
+| ------------- | -------------------------------------------- | ------------------------------------------------ |
+| container_ids | JSON array of running container IDs          | `["abc123", "def456"]`                           |
+| container_ips | JSON array of container IP addresses         | `["172.17.0.2", "172.17.0.3"]`                   |
+| instances     | JSON object mapping slug to instance details | See [Instances Output](#instances-output)        |
+| gerrit_urls   | Comma-separated list of Gerrit HTTP URLs     | `http://172.17.0.2:8080,http://172.17.0.3:8080`  |
+| api_paths     | JSON object mapping slug to API path details | `{"onap": {"api_path": "/r", "api_url": "..."}}` |
+| ssh_host_keys | JSON object mapping slug to SSH host keys    | `{"onap": {"ssh_host_ed25519_key": "..."}}`      |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -342,6 +366,86 @@ steps:
         https://example.com/plugins/my-plugin.jar,
         https://example.com/plugins/another-plugin.jar
 ```
+
+### Example 8: Public Access via Bore Tunnel
+
+This example shows how to expose Gerrit publicly using
+[bore](https://github.com/ekzhang/bore) tunnels. Bore tunnels can be started
+before Gerrit since they connect on-demand when traffic arrives.
+
+<!-- markdownlint-disable MD013 -->
+
+```yaml
+steps:
+  # Calculate the local ports that Gerrit will use
+  - name: "Calculate local ports"
+    id: ports
+    run: |
+      # These match gerrit-action defaults (BASE_PORT + index)
+      echo "http_port=8080" >> "$GITHUB_OUTPUT"
+      echo "ssh_port=29418" >> "$GITHUB_OUTPUT"
+
+  # Install bore tunnel client
+  - name: "Install bore"
+    run: |
+      BORE_VERSION="0.5.2"
+      curl -sSL "https://github.com/ekzhang/bore/releases/download/v${BORE_VERSION}/bore-v${BORE_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar xz
+      sudo mv bore /usr/local/bin/
+
+  # Start tunnels BEFORE Gerrit (bore connects on-demand)
+  - name: "Start bore tunnels"
+    id: tunnels
+    env:
+      LOCAL_HTTP: ${{ steps.ports.outputs.http_port }}
+      LOCAL_SSH: ${{ steps.ports.outputs.ssh_port }}
+      SERVER_SLUG: my-gerrit  # Must match slug in gerrit_setup
+    run: |
+      # Start tunnels - local ports don't need to be listening yet!
+      bore local "$LOCAL_HTTP" --to bore.pub > bore-http.log 2>&1 &
+      bore local "$LOCAL_SSH" --to bore.pub > bore-ssh.log 2>&1 &
+
+      # Wait for tunnels to establish
+      sleep 10
+
+      # Extract assigned public ports from logs
+      HTTP_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-http.log)
+      SSH_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-ssh.log)
+
+      # Build tunnel_ports JSON for gerrit-action
+      TUNNEL_PORTS=$(jq -n \
+        --arg slug "$SERVER_SLUG" \
+        --argjson http "$HTTP_PORT" \
+        --argjson ssh "$SSH_PORT" \
+        '{($slug): {http: $http, ssh: $ssh}}')
+
+      echo "tunnel_ports=$TUNNEL_PORTS" >> "$GITHUB_OUTPUT"
+      echo "Tunnels ready: bore.pub:$HTTP_PORT (HTTP), bore.pub:$SSH_PORT (SSH)"
+
+  # Start Gerrit with tunnel URLs configured from the start
+  - name: "Start Gerrit mirror"
+    id: gerrit
+    uses: lfreleng-actions/gerrit-server-action@main
+    with:
+      gerrit_setup: |
+        [{
+          "project": "my-project",
+          "slug": "my-gerrit",
+          "gerrit": "gerrit.example.org"
+        }]
+      ssh_private_key: ${{ secrets.GERRIT_SSH_KEY }}
+      sync_on_startup: true
+      # Pass tunnel configuration - Gerrit uses public URLs from the start
+      tunnel_host: bore.pub
+      tunnel_ports: ${{ steps.tunnels.outputs.tunnel_ports }}
+
+  # Gerrit is now accessible at the public bore.pub URLs!
+```
+
+<!-- markdownlint-enable MD013 -->
+
+> **Real-world example:** See
+> [`test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml`](../test-gerrit-servers/.github/workflows/debug-gerrit-bore.yaml)
+> for a complete working implementation.
 
 ## Using Repository Variables
 
