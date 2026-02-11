@@ -98,13 +98,15 @@ Use this action in CI/CD pipelines that need to:
 
 <!-- markdownlint-disable MD013 -->
 
-| Name           | Required | Default           | Description                                                   |
-| -------------- | -------- | ----------------- | ------------------------------------------------------------- |
-| gerrit_version | False    | `3.13.1-ubuntu24` | Gerrit Docker image version tag                               |
-| plugin_version | False    | `stable-3.13`     | Pull-replication plugin version/branch                        |
-| base_http_port | False    | `8080`            | Starting HTTP port (increments for multi-instance)            |
-| base_ssh_port  | False    | `29418`           | Starting SSH port (increments for multi-instance)             |
-| auth_type      | False    | `ssh`             | Authentication method: `ssh`, `http_basic`, or `bearer_token` |
+| Name            | Required | Default           | Description                                                        |
+| --------------- | -------- | ----------------- | ------------------------------------------------------------------ |
+| gerrit_version  | False    | `3.13.1-ubuntu24` | Gerrit Docker image version tag                                    |
+| plugin_version  | False    | `stable-3.13`     | Pull-replication plugin version/branch                             |
+| base_http_port  | False    | `8080`            | Starting HTTP port (increments for multi-instance)                 |
+| base_ssh_port   | False    | `29418`           | Starting SSH port (increments for multi-instance)                  |
+| auth_type       | False    | `ssh`             | Authentication method: `ssh`, `http_basic`, or `bearer_token`      |
+| remote_ssh_user | False    | `gerrit`          | SSH username for remote Gerrit servers (can override per-instance) |
+| remote_ssh_port | False    | `29418`           | SSH port for remote Gerrit servers (can override per-instance)     |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -112,15 +114,16 @@ Use this action in CI/CD pipelines that need to:
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                        | Required | Default | Description                                                                |
-| --------------------------- | -------- | ------- | -------------------------------------------------------------------------- |
-| sync_on_startup             | False    | `true`  | Trigger replication after startup                                          |
-| fetch_every                 | False    | `60s`   | Interval for pull-replication polling (e.g., `60s`, `5m`, `0s` to disable) |
-| replication_timeout         | False    | `600`   | Timeout for initial replication sync (seconds)                             |
-| replication_wait_timeout    | False    | `900`   | Max time to wait for replication to match expected repo count (seconds)    |
-| require_replication_success | False    | `true`  | Fail workflow if replication verification fails                            |
-| sync_refs                   | False    | (all)   | Comma-separated refs to sync (e.g., `+refs/heads/*:refs/heads/*`)          |
-| replication_threads         | False    | `4`     | Number of replication threads per instance                                 |
+| Name                        | Required | Default | Description                                                                       |
+| --------------------------- | -------- | ------- | --------------------------------------------------------------------------------- |
+| sync_on_startup             | False    | `true`  | Trigger replication after startup                                                 |
+| fetch_every                 | False    | `60s`   | Interval for pull-replication polling (e.g., `60s`, `5m`, `0s` to disable)        |
+| replication_timeout         | False    | `600`   | Timeout for initial replication sync (seconds)                                    |
+| replication_wait_timeout    | False    | `600`   | Max time to wait for replication to match expected repo count (seconds)           |
+| require_replication_success | False    | `true`  | Fail workflow if replication verification fails                                   |
+| sync_refs                   | False    | (all)   | Comma-separated refs to sync (e.g., `+refs/heads/*:refs/heads/*`)                 |
+| replication_threads         | False    | `4`     | Number of replication threads per instance                                        |
+| max_projects                | False    | `800`   | Maximum projects to fetch when no filter specified (increase for large instances) |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -217,7 +220,9 @@ The `gerrit_setup` input accepts a JSON array of instance configurations:
     "slug": "opendaylight",
     "gerrit": "git.opendaylight.org",
     "project": "releng/.*",
-    "api_path": "/gerrit"
+    "api_path": "/gerrit",
+    "ssh_user": "replication-bot",
+    "ssh_port": "29418"
   }
 ]
 ```
@@ -235,6 +240,11 @@ The `gerrit_setup` input accepts a JSON array of instance configurations:
   - **Regex pattern**: `"releng/.*"` or `"^infra/.*"` - pattern matching
 - **`api_path`** (optional) - API path prefix if Gerrit is not at the root
   (e.g., `/infra`, `/r`, `/gerrit`). Auto-detected if not provided.
+- **`ssh_user`** (optional) - SSH username for the remote Gerrit server.
+  Overrides global `remote_ssh_user`. This is the account on the remote
+  server that has your `ssh_private_key`'s public key registered.
+- **`ssh_port`** (optional) - SSH port for the remote Gerrit server.
+  Overrides global `remote_ssh_port`. Typically `29418` for Gerrit.
 
 ### Project Filter Behavior
 

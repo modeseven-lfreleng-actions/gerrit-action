@@ -545,7 +545,7 @@ if [ $VERIFICATION_FAILED -eq 0 ]; then
     done < "$WORK_DIR/replication_stats.txt"
   else
     for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
-      echo "| $slug | ✅ | - | - | - |" >> "$GITHUB_STEP_SUMMARY"
+      echo "| $slug | ✅ | - | - |" >> "$GITHUB_STEP_SUMMARY"
     done
   fi
 

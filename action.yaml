@@ -74,6 +74,20 @@ inputs:
     description: "Authentication method: ssh, http_basic, or bearer_token"
     required: false
     default: 'ssh'
+  remote_ssh_user:
+    description: |
+      SSH username for authenticating to remote Gerrit servers.
+      This is the account on the REMOTE Gerrit server that has the
+      ssh_private_key's corresponding public key registered.
+      Can be overridden per-instance in gerrit_setup with 'ssh_user'.
+    required: false
+    default: 'gerrit'
+  remote_ssh_port:
+    description: |
+      SSH port for remote Gerrit servers (typically 29418).
+      Can be overridden per-instance in gerrit_setup with 'ssh_port'.
+    required: false
+    default: '29418'
 
   # Optional - Replication Settings
   sync_on_startup:
@@ -107,7 +121,7 @@ inputs:
       project filter is specified. Limits API queries for large instances.
       Set to a higher value if you need to replicate more projects.
     required: false
-    default: '500'
+    default: '800'
   require_replication_success:
     description: |
       If true and sync_on_startup is true, the workflow will fail
@@ -445,6 +459,8 @@ runs:
         HTTP_PASSWORD: ${{ inputs.http_password }}
         BEARER_TOKEN: ${{ inputs.bearer_token }}
         AUTH_TYPE: ${{ inputs.auth_type }}
+        REMOTE_SSH_USER: ${{ inputs.remote_ssh_user }}
+        REMOTE_SSH_PORT: ${{ inputs.remote_ssh_port }}
         GERRIT_VERSION: ${{ inputs.gerrit_version }}
         PLUGIN_VERSION: ${{ inputs.plugin_version }}
         BASE_HTTP_PORT: ${{ inputs.base_http_port }}
