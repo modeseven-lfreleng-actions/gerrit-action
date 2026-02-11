@@ -17,6 +17,50 @@ if [ -z "${SSH_AUTH_KEYS:-}" ]; then
   exit 0
 fi
 
+# Validate SSH_AUTH_USERNAME if provided
+# Only allow safe characters to prevent command injection
+if [ -n "${SSH_AUTH_USERNAME:-}" ]; then
+  if ! [[ "$SSH_AUTH_USERNAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "::error::Invalid SSH_AUTH_USERNAME: '$SSH_AUTH_USERNAME'"
+    echo "::error::Username must contain only letters, numbers, dots, underscores, and hyphens"
+    exit 1
+  fi
+  if [ ${#SSH_AUTH_USERNAME} -gt 64 ]; then
+    echo "::error::SSH_AUTH_USERNAME too long (max 64 characters)"
+    exit 1
+  fi
+fi
+
+# Validate SSH_AUTH_KEYS format
+# Each line should start with a valid SSH key type
+validate_ssh_keys() {
+  local keys="$1"
+  local valid_types="ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256"
+  local line_num=0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_num=$((line_num + 1))
+    # Skip empty lines and comments
+    [ -z "$line" ] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+    # Check if line starts with a valid SSH key type
+    if ! echo "$line" | grep -qE "^($valid_types) "; then
+      echo "::error::Invalid SSH key format on line $line_num"
+      echo "::error::Expected format: <key-type> <base64-key> [comment]"
+      echo "::error::Got: ${line:0:50}..."
+      return 1
+    fi
+  done <<< "$keys"
+  return 0
+}
+
+if ! validate_ssh_keys "$SSH_AUTH_KEYS"; then
+  echo "::error::SSH_AUTH_KEYS validation failed"
+  exit 1
+fi
+
 echo "Adding SSH authentication keys to Gerrit container(s)..."
 
 # Determine account configuration

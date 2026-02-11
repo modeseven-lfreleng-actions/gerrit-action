@@ -19,13 +19,22 @@ CUSTOM_IMAGE_TAG="${GERRIT_VERSION}"
 CUSTOM_IMAGE="${CUSTOM_IMAGE_NAME}:${CUSTOM_IMAGE_TAG}"
 
 # Build custom Gerrit image with uv and gerrit_to_platform
-build_custom_image() {
+# Check if custom image exists or build it
+ensure_custom_image() {
+  # First, check if the custom image already exists (built by action.yaml)
+  if docker image inspect "${CUSTOM_IMAGE}" >/dev/null 2>&1; then
+    echo "Custom image ${CUSTOM_IMAGE} already exists ✅"
+    return 0
+  fi
+
+  # Image doesn't exist, try to build it
+  # Use BASH_SOURCE[0] instead of $0 for reliable path resolution when sourced
   local dockerfile_dir
-  dockerfile_dir="$(dirname "$0")/.."
+  dockerfile_dir="$(dirname "${BASH_SOURCE[0]}")/.."
 
   # Check if Dockerfile exists
   if [ ! -f "$dockerfile_dir/Dockerfile" ]; then
-    echo "::warning::Dockerfile not found at $dockerfile_dir/Dockerfile"
+    echo "::warning::Custom image not found and Dockerfile not available"
     echo "::warning::Falling back to official gerritcodereview/gerrit image"
     CUSTOM_IMAGE="gerritcodereview/gerrit:${GERRIT_VERSION}"
     return 0
@@ -62,8 +71,8 @@ build_custom_image() {
   fi
 }
 
-# Build the custom image before starting instances
-build_custom_image
+# Ensure custom image is available before starting instances
+ensure_custom_image
 
 # Function to get API path for a slug
 get_api_path() {
@@ -169,8 +178,32 @@ fetch_remote_projects() {
   echo "  API URL: $full_url" >&2
 
   # Fetch projects (Gerrit API returns )]}' prefix for XSSI protection)
+  # Build curl args with authentication based on auth_type
+  local -a curl_args
+  curl_args=(-s --connect-timeout 30 --max-time 60)
+
+  case "${AUTH_TYPE:-}" in
+    http_basic)
+      if [ -n "${HTTP_USERNAME:-}" ] && [ -n "${HTTP_PASSWORD:-}" ]; then
+        curl_args+=(-u "${HTTP_USERNAME}:${HTTP_PASSWORD}")
+        echo "  Using HTTP basic authentication" >&2
+      fi
+      ;;
+    bearer_token)
+      if [ -n "${BEARER_TOKEN:-}" ]; then
+        curl_args+=(-H "Authorization: Bearer ${BEARER_TOKEN}")
+        echo "  Using bearer token authentication" >&2
+      fi
+      ;;
+    ssh)
+      # SSH auth doesn't apply to REST API calls
+      # Most Gerrit servers allow anonymous project listing
+      echo "  Using anonymous access for REST API" >&2
+      ;;
+  esac
+
   local response
-  response=$(curl -s --connect-timeout 30 --max-time 60 "$full_url" 2>/dev/null) || {
+  response=$(curl "${curl_args[@]}" "$full_url" 2>/dev/null) || {
     echo "  Warning: Failed to fetch project list from $gerrit_host" >&2
     return 1
   }
@@ -285,9 +318,17 @@ EOF
   fi
 
   # Continue with remaining remote settings
+  # Calculate connectionTimeout to be at least as large as timeout
+  # timeout is in seconds, connectionTimeout is in milliseconds
+  local timeout_ms=$((REPLICATION_TIMEOUT * 1000))
+  local connection_timeout_ms=$timeout_ms
+  if [ "$connection_timeout_ms" -lt 120000 ]; then
+    connection_timeout_ms=120000  # Minimum 2 minutes
+  fi
+
   cat >> "$config_file" <<EOF
   timeout = $REPLICATION_TIMEOUT
-  connectionTimeout = 120000
+  connectionTimeout = $connection_timeout_ms
   replicationDelay = 0
   replicationRetry = 60
   threads = $REPLICATION_THREADS

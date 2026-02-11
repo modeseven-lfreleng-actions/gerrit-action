@@ -320,6 +320,15 @@ wait_for_replication() {
       return 0
     fi
 
+    # When no expected_count is available, fall back to pull_replication_log completion
+    # to avoid timing out even if replication has successfully finished.
+    if [ "$expected_count" -le 0 ] && check_pull_replication_log "$cid"; then
+      echo ""
+      echo "  ✅ Replication complete: $current_count repositories (log indicates completion)"
+      show_git_disk_usage "$cid"
+      return 0
+    fi
+
     # Show progress every 15 seconds
     if [ $((elapsed % 15)) -eq 0 ]; then
       local disk_human
