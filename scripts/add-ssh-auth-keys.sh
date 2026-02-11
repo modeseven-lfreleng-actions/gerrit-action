@@ -401,12 +401,19 @@ EOF
 git add .
 git commit -m "Add external ID for $username" --allow-empty
 
-git push /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids 2>/dev/null || true
+# Force push to handle potential conflicts with concurrent updates
+if ! git push --force /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids; then
+  echo "ERROR: Failed to push external ID for $username"
+  exit 1
+fi
+echo "External ID registered successfully for $username"
 EXTID_SCRIPT_EOF
 
   docker cp "$extid_script" "$cid:/tmp/register-external-ids.sh"
   rm -f "$extid_script"
-  docker exec "$cid" bash /tmp/register-external-ids.sh
+  if ! docker exec "$cid" bash /tmp/register-external-ids.sh; then
+    echo "::warning::Failed to register external ID for $username"
+  fi
 }
 
 # Function to add user to Administrators group for full permissions
@@ -525,12 +532,30 @@ flush_caches() {
 
   echo "  Reloading Gerrit caches..."
 
-  # Use correct SSH key path: /var/gerrit/ssh/id_rsa (not .ssh)
+  # Try HTTP-based cache flush first (works with DEVELOPMENT_BECOME_ANY_ACCOUNT)
+  # This is more reliable than SSH as it doesn't require internal admin account setup
   docker exec "$cid" bash -c '
     # Wait a moment for Gerrit to be ready
     sleep 2
 
-    # SSH key path - check both locations
+    # Get a session by "becoming" account 1000000 (internal admin)
+    # In DEVELOPMENT_BECOME_ANY_ACCOUNT mode, this gives us admin access
+    SESSION_COOKIE=$(curl -s -c - "http://localhost:8080/login/?account_id=1000000" 2>/dev/null | grep GerritAccount | awk "{print \$7}")
+    XSRF_TOKEN=$(curl -s -c - "http://localhost:8080/login/?account_id=1000000" 2>/dev/null | grep XSRF_TOKEN | awk "{print \$7}")
+
+    if [ -n "$SESSION_COOKIE" ] && [ -n "$XSRF_TOKEN" ]; then
+      echo "Using HTTP API to flush caches..."
+      for cache in accounts external_ids groups groups_byuuid groups_members; do
+        curl -s -X POST \
+          -b "GerritAccount=$SESSION_COOKIE" \
+          -H "X-Gerrit-Auth: $XSRF_TOKEN" \
+          "http://localhost:8080/a/config/server/caches/$cache/flush" 2>/dev/null || true
+      done
+      echo "HTTP cache flush completed"
+      exit 0
+    fi
+
+    # Fall back to SSH-based cache flush
     SSH_KEY="/var/gerrit/ssh/id_rsa"
     if [ ! -f "$SSH_KEY" ]; then
       SSH_KEY="/var/gerrit/.ssh/id_rsa"
@@ -548,7 +573,7 @@ flush_caches() {
            -i "$SSH_KEY" \
            admin@localhost \
            gerrit flush-caches --all 2>/dev/null; then
-      echo "All caches flushed successfully"
+      echo "All caches flushed successfully via SSH"
       exit 0
     fi
 
@@ -562,7 +587,7 @@ flush_caches() {
           admin@localhost \
           gerrit flush-caches --cache "$cache" 2>/dev/null || true
     done
-  ' || echo "  Note: Cache flush via SSH not available, changes may take effect on next Gerrit restart"
+  ' || echo "  Note: Cache flush not available, changes may take effect on next Gerrit restart"
 }
 
 # Process each instance
