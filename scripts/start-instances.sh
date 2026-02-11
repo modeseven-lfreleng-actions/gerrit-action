@@ -196,9 +196,11 @@ generate_replication_config() {
   local slug="$2"
   local gerrit_host="$3"
   local project="${4:-}"
+  local remote_ssh_user="${5:-gerrit}"
+  local remote_ssh_port="${6:-29418}"
 
   # Get API path for this instance (detected by detect-api-paths.sh)
-  # Note: We no longer use apiUrl because it's mutually exclusive with fetchEvery
+  # Note: API path is only used for HTTP URLs, NOT for SSH URLs
   local api_path
   api_path=$(get_api_path "$slug")
 
@@ -207,19 +209,13 @@ generate_replication_config() {
   auth_type="${auth_type,,}"
 
   # Build the replication URL based on auth type
-  # For SSH auth, use Gerrit's SSH endpoint (no /a/ prefix or HTTPS)
+  # For SSH auth, use Gerrit's SSH endpoint (no api_path - SSH doesn't use HTTP context paths)
   # For HTTP-based auth (basic, bearer, etc.), use authenticated git-over-https with /a/
   local git_url
   if [ "$auth_type" = "ssh" ]; then
-    # SSH URL format: ssh://gerrit@<host>/<api_path>/${name}.git
-    if [ -n "$api_path" ]; then
-      # Normalize api_path: strip leading and trailing slashes
-      api_path="${api_path#/}"
-      api_path="${api_path%/}"
-      git_url="ssh://gerrit@${gerrit_host}/${api_path}/\${name}.git"
-    else
-      git_url="ssh://gerrit@${gerrit_host}/\${name}.git"
-    fi
+    # SSH URL format: ssh://<user>@<host>:<port>/${name}.git
+    # Note: SSH URLs do NOT include api_path - that's an HTTP-only concept
+    git_url="ssh://${remote_ssh_user}@${gerrit_host}:${remote_ssh_port}/\${name}.git"
   else
     # For HTTP Basic/Bearer auth, Gerrit uses /a/ prefix for authenticated access
     # URL format: https://<host>/<api_path>/a/${name}.git
@@ -628,7 +624,20 @@ start_instance() {
   local gerrit_host
   gerrit_host=$(echo "$instance_json" | jq -r '.gerrit')
 
-  # Calculate ports
+  # Get remote SSH settings (per-instance override or global default)
+  # These are for connecting TO the remote Gerrit server for pull-replication
+  local remote_ssh_user
+  remote_ssh_user=$(echo "$instance_json" | jq -r '.ssh_user // ""')
+  if [ -z "$remote_ssh_user" ]; then
+    remote_ssh_user="${REMOTE_SSH_USER:-gerrit}"
+  fi
+  local remote_ssh_port
+  remote_ssh_port=$(echo "$instance_json" | jq -r '.ssh_port // ""')
+  if [ -z "$remote_ssh_port" ]; then
+    remote_ssh_port="${REMOTE_SSH_PORT:-29418}"
+  fi
+
+  # Calculate ports (for local container)
   local http_port=$((BASE_HTTP_PORT + index))
   local ssh_port=$((BASE_SSH_PORT + index))
 
@@ -778,7 +787,7 @@ start_instance() {
   # Note: pull-replication plugin uses replication.config (same as bundled plugin)
   # We remove the bundled replication.jar to avoid conflicts
   generate_replication_config "$instance_dir/etc/replication.config" \
-    "$slug" "$gerrit_host" "$project"
+    "$slug" "$gerrit_host" "$project" "$remote_ssh_user" "$remote_ssh_port"
   generate_secure_config "$instance_dir/etc/secure.config" "$slug"
 
   # Fetch project list from remote and pre-create directories for replication
