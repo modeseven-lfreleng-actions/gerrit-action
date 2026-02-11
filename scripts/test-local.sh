@@ -189,8 +189,12 @@ echo ""
 
 # Create directory structure
 log_info "Creating Gerrit site structure..."
+# The official gerritcodereview/gerrit image uses UID:GID 1000:1000
+GERRIT_UID=1000
+GERRIT_GID=1000
 mkdir -p "$INSTANCE_DIR"/{git,cache,index,data,etc,logs,plugins,tmp}
-chmod -R 777 "$INSTANCE_DIR"
+chown -R "$GERRIT_UID:$GERRIT_GID" "$INSTANCE_DIR"
+chmod -R 755 "$INSTANCE_DIR"
 
 # Build git URL - use authenticated HTTPS with /a/ prefix
 # The /a/ prefix is Gerrit's authenticated endpoint
@@ -245,6 +249,9 @@ cat > "$INSTANCE_DIR/etc/secure.config" <<EOF
   username = ${GERRIT_HTTP_USERNAME}
   password = ${GERRIT_HTTP_PASSWORD}
 EOF
+# Set ownership to Gerrit UID/GID (1000:1000) so container can read it
+# This is necessary because bind mounts preserve host UID/GID
+chown "$GERRIT_UID:$GERRIT_GID" "$INSTANCE_DIR/etc/secure.config"
 chmod 600 "$INSTANCE_DIR/etc/secure.config"
 log_success "secure.config created"
 
@@ -331,7 +338,9 @@ log_info "Pre-creating project directory: ${PROJECT}.git"
 PROJECT_DIR="$INSTANCE_DIR/git/${PROJECT}.git"
 mkdir -p "$PROJECT_DIR"
 git init --bare "$PROJECT_DIR" 2>/dev/null
-chmod -R 777 "$PROJECT_DIR"
+# Set proper ownership for Gerrit user (UID:GID 1000:1000)
+chown -R 1000:1000 "$PROJECT_DIR"
+chmod -R 755 "$PROJECT_DIR"
 log_success "Project directory created"
 
 # Start Gerrit container

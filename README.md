@@ -237,7 +237,9 @@ The `gerrit_setup` input accepts a JSON array of instance configurations:
   - **Empty string** (`""`) or omitted: Replicate **all projects** from the server
   - **Literal name**: `"releng/lftools"` - single project
   - **Comma-separated**: `"releng/lftools,ci-management"` - multiple projects
-  - **Regex pattern**: `"releng/.*"` or `"^infra/.*"` - pattern matching
+  - **Regex pattern**: `"regex:releng/.*"` or `"regex:^infra/.*"` - pattern
+    matching (must use `regex:` prefix to avoid misclassifying literal names
+    containing special characters like `.` or `[`)
 - **`api_path`** (optional) - API path prefix if Gerrit is not at the root
   (e.g., `/infra`, `/r`, `/gerrit`). Auto-detected if not provided.
 - **`ssh_user`** (optional) - SSH username for the remote Gerrit server.
@@ -422,8 +424,17 @@ steps:
       sleep 10
 
       # Extract assigned public ports from logs
-      HTTP_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-http.log)
-      SSH_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-ssh.log)
+      HTTP_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-http.log || true)
+      SSH_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore-ssh.log || true)
+
+      # Validate extracted ports before using them
+      if [ -z "$HTTP_PORT" ] || [ -z "$SSH_PORT" ] || \
+         ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]]; then
+        echo "Error: Failed to extract valid bore tunnel ports from logs." >&2
+        echo "HTTP_PORT='$HTTP_PORT', SSH_PORT='$SSH_PORT'" >&2
+        echo "Check bore-http.log and bore-ssh.log for connection issues." >&2
+        exit 1
+      fi
 
       # Build tunnel_ports JSON for gerrit-action
       TUNNEL_PORTS=$(jq -n \

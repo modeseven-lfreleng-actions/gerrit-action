@@ -166,12 +166,10 @@ fetch_remote_projects() {
   # Add query parameters
   local query_params="n=${max_projects}"
   if [ -n "$project_filter" ] && [ "$project_filter" != ".*" ]; then
-    # Use regex filter if it looks like a pattern, otherwise prefix match
-    if [[ "$project_filter" == *"*"* ]] || [[ "$project_filter" == *"."* ]]; then
-      query_params="${query_params}&r=$(printf '%s' "$project_filter" | jq -sRr @uri)"
-    else
-      query_params="${query_params}&p=$(printf '%s' "$project_filter" | jq -sRr @uri)"
-    fi
+    # Always use regex param (r=) when a filter is provided
+    # The caller is responsible for stripping the "regex:" prefix if present
+    # and only passing filters that should be treated as regex patterns
+    query_params="${query_params}&r=$(printf '%s' "$project_filter" | jq -sRr @uri)"
   fi
 
   local full_url="${api_url}?${query_params}"
@@ -454,9 +452,14 @@ init_gerrit_site() {
 
   echo "Initializing Gerrit site for $slug..."
 
-  # Create directory structure
+  # Create directory structure with proper Gerrit ownership
+  # The official gerritcodereview/gerrit image uses UID:GID 1000:1000
+  local GERRIT_UID=1000
+  local GERRIT_GID=1000
+
   mkdir -p "$instance_dir"/{git,cache,index,data,etc,logs,plugins,tmp}
-  chmod -R 777 "$instance_dir"
+  chown -R "$GERRIT_UID:$GERRIT_GID" "$instance_dir"
+  chmod -R 755 "$instance_dir"
 
   # Run Gerrit init using the container's entrypoint
   # Mount only specific subdirectories to avoid hiding /var/gerrit/bin
@@ -522,8 +525,9 @@ configure_gerrit() {
   # Set auth to development mode for testing
   git config -f "$config_file" auth.type "DEVELOPMENT_BECOME_ANY_ACCOUNT"
 
-  # Container user
-  git config -f "$config_file" container.user "root"
+  # Container user - run as the gerrit user (UID 1000) for security
+  # Directories are chowned to match this UID during init_gerrit_site
+  git config -f "$config_file" container.user "gerrit"
 
   # Enable replication plugin
   git config -f "$config_file" plugin.pull-replication.enabled "true"
@@ -589,17 +593,18 @@ fetch_expected_project_count() {
     fi
   else
     # Handle comma-separated project list or single project/pattern
-    # Check if it's a regex pattern (contains special chars)
-    if [[ "$project" == *"*"* ]] || [[ "$project" == *"["* ]] || \
-       [[ "$project" == "^"* ]] || [[ "$project" == ".*" ]]; then
-      echo "  Project filter appears to be a regex: $project"
+    # Check if it's explicitly marked as a regex pattern with "regex:" prefix
+    # This avoids misclassifying literal project names like "my.project" or "name[v2]"
+    if [[ "$project" == regex:* ]]; then
+      local regex_pattern="${project#regex:}"
+      echo "  Project filter explicitly marked as regex: $regex_pattern"
       echo "  Fetching matching projects from remote..."
 
       local api_path
       api_path=$(get_api_path "$slug")
 
       local remote_projects
-      if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "$project" "$max_projects"); then
+      if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "$regex_pattern" "$max_projects"); then
         while IFS= read -r proj; do
           [ -n "$proj" ] && projects_found+=("$proj")
         done <<< "$remote_projects"
@@ -645,7 +650,9 @@ fetch_expected_project_count() {
     if [ ! -d "$project_dir" ]; then
       mkdir -p "$project_dir"
       git init --bare "$project_dir" >/dev/null 2>&1
-      chmod -R 777 "$project_dir"
+      # Set proper ownership for Gerrit user (UID:GID 1000:1000)
+      chown -R 1000:1000 "$project_dir"
+      chmod -R 755 "$project_dir"
       created_count=$((created_count + 1))
     fi
   done
@@ -701,9 +708,35 @@ start_instance() {
   local use_tunnel="false"
 
   if [ -n "${TUNNEL_HOST:-}" ] && [ -n "${TUNNEL_PORTS:-}" ]; then
-    # Extract tunnel ports for this slug from JSON
-    tunnel_http_port=$(echo "$TUNNEL_PORTS" | jq -r --arg s "$slug" '.[$s].http // empty')
-    tunnel_ssh_port=$(echo "$TUNNEL_PORTS" | jq -r --arg s "$slug" '.[$s].ssh // empty')
+    # Validate TUNNEL_PORTS is valid JSON before parsing
+    if ! echo "$TUNNEL_PORTS" | jq -e . >/dev/null 2>&1; then
+      echo "  Warning: TUNNEL_PORTS is not valid JSON, falling back to localhost URLs"
+    else
+      # Extract tunnel ports for this slug from JSON
+      tunnel_http_port=$(echo "$TUNNEL_PORTS" | jq -r --arg s "$slug" '.[$s].http // empty')
+      tunnel_ssh_port=$(echo "$TUNNEL_PORTS" | jq -r --arg s "$slug" '.[$s].ssh // empty')
+
+      # Validate extracted ports are numeric and in valid range (1-65535)
+      validate_port() {
+        local port="$1"
+        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+          return 0
+        fi
+        return 1
+      }
+
+      if [ -n "$tunnel_http_port" ] && [ -n "$tunnel_ssh_port" ]; then
+        if ! validate_port "$tunnel_http_port"; then
+          echo "  Warning: Invalid HTTP tunnel port '$tunnel_http_port', falling back to localhost URLs"
+          tunnel_http_port=""
+          tunnel_ssh_port=""
+        elif ! validate_port "$tunnel_ssh_port"; then
+          echo "  Warning: Invalid SSH tunnel port '$tunnel_ssh_port', falling back to localhost URLs"
+          tunnel_http_port=""
+          tunnel_ssh_port=""
+        fi
+      fi
+    fi
 
     if [ -n "$tunnel_http_port" ] && [ -n "$tunnel_ssh_port" ]; then
       use_tunnel="true"

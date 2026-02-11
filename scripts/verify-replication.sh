@@ -78,7 +78,8 @@ check_replication_errors() {
   if docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
     # Run tail and grep inside the container to check for error patterns
     # Using tail -n 500 to scan recent log entries without loading the entire file
-    if docker exec "$cid" sh -c "tail -n 500 /var/gerrit/logs/pull_replication_log 2>/dev/null | grep -iE 'Cannot replicate|TransportException|git-upload-pack not permitted|Authentication.*failed|Permission denied|Connection refused|error|failed|Exception'" >/dev/null 2>&1; then
+    # Use specific error patterns to avoid false positives (e.g., "Successfully handled exception")
+    if docker exec "$cid" sh -c "tail -n 500 /var/gerrit/logs/pull_replication_log 2>/dev/null | grep -iE 'Cannot replicate|TransportException|git-upload-pack not permitted|Authentication.*failed|Permission denied|Connection refused|\\bERROR\\b|\\bFATAL\\b'" >/dev/null 2>&1; then
       return 0  # Found errors
     fi
   fi
@@ -195,6 +196,12 @@ validate_project_count() {
     echo "  ✅ Project count matches expected (within 5% tolerance)"
     return 0
   else
+    # Defensive guard against division by zero (should not reach here if expected_count=0
+    # due to early return above, but adding for safety)
+    if [ "$expected_count" -eq 0 ]; then
+      echo "  ⚠️ Project count mismatch: expected count is zero, cannot compute percentage"
+      return 1
+    fi
     local percentage=$((actual_count * 100 / expected_count))
     echo "  ⚠️ Project count mismatch: got $percentage% of expected projects"
     return 1
@@ -312,10 +319,11 @@ wait_for_replication() {
     local current_count
     current_count=$(count_repositories "$cid")
 
-    # Complete when repo count matches expected
-    if [ "$expected_count" -gt 0 ] && [ "$current_count" -ge "$expected_count" ]; then
+    # Complete when repo count matches expected AND pull_replication_log indicates activity
+    # This avoids treating pre-created empty bare repos as "replicated"
+    if [ "$expected_count" -gt 0 ] && [ "$current_count" -ge "$expected_count" ] && check_pull_replication_log "$cid"; then
       echo ""
-      echo "  ✅ Replication complete: $current_count/$expected_count repositories"
+      echo "  ✅ Replication complete: $current_count/$expected_count repositories (log indicates completion)"
       show_git_disk_usage "$cid"
       return 0
     fi
@@ -334,7 +342,11 @@ wait_for_replication() {
       local disk_human
       disk_human=$(docker exec "$cid" sh -c "du -sh /var/gerrit/git 2>/dev/null | cut -f1" || echo "?")
       if [ "$expected_count" -gt 0 ]; then
-        local pct=$((current_count * 100 / expected_count))
+        # Defensive guard: verify expected_count is non-zero before division
+        local pct="?"
+        if [ "$expected_count" -ne 0 ]; then
+          pct=$((current_count * 100 / expected_count))
+        fi
         echo "  [${elapsed}s/${timeout}s] $current_count/$expected_count repos ($pct%) disk=$disk_human"
       else
         echo "  [${elapsed}s/${timeout}s] $current_count repos disk=$disk_human"
@@ -493,6 +505,11 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   echo "  Replicated repositories: $final_count"
   if [ "$expected_count" -gt 0 ]; then
     echo "  Expected from remote: $expected_count"
+
+    # Validate project count with tolerance check
+    if ! validate_project_count "$cid" "$slug" "$expected_count"; then
+      echo "::warning::Project count validation failed for $slug"
+    fi
   fi
 
   # Show final disk usage
