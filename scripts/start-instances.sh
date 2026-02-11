@@ -108,6 +108,8 @@ echo "{}" > "$INSTANCES_JSON_FILE"
 setup_ssh_auth() {
   local instance_dir="$1"
   local gerrit_host="$2"
+  local ssh_user="${3:-gerrit}"
+  local ssh_port="${4:-29418}"
 
   # Create SSH directory
   mkdir -p "$instance_dir/ssh"
@@ -118,24 +120,26 @@ setup_ssh_auth() {
   chmod 600 "$instance_dir/ssh/id_rsa"
 
   # Setup known_hosts
+  # For non-standard ports, known_hosts entries must be in [host]:port format
   if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
     echo "$SSH_KNOWN_HOSTS" > "$instance_dir/ssh/known_hosts"
   else
-    # Auto-fetch host key
-    echo "Auto-fetching SSH host key for $gerrit_host..."
-    ssh-keyscan -H "$gerrit_host" 2>/dev/null \
+    # Auto-fetch host key with correct port
+    echo "Auto-fetching SSH host key for $gerrit_host:$ssh_port..."
+    ssh-keyscan -H -p "$ssh_port" "$gerrit_host" 2>/dev/null \
       > "$instance_dir/ssh/known_hosts" || {
-      echo "Warning: Could not fetch SSH host key for $gerrit_host"
+      echo "Warning: Could not fetch SSH host key for $gerrit_host:$ssh_port"
       touch "$instance_dir/ssh/known_hosts"
     }
   fi
   chmod 644 "$instance_dir/ssh/known_hosts"
 
-  # Create SSH config
+  # Create SSH config with correct user and port
   cat > "$instance_dir/ssh/config" <<EOF
 Host $gerrit_host
   HostName $gerrit_host
-  User git
+  User $ssh_user
+  Port $ssh_port
   IdentityFile /var/gerrit/ssh/id_rsa
   StrictHostKeyChecking yes
   UserKnownHostsFile /var/gerrit/ssh/known_hosts
@@ -852,9 +856,9 @@ start_instance() {
   download_plugin "$instance_dir/plugins" || return 1
   download_additional_plugins "$instance_dir/plugins" || return 1
 
-  # Setup authentication
+  # Setup authentication with correct remote SSH user and port
   if [ "$AUTH_TYPE" = "ssh" ]; then
-    setup_ssh_auth "$instance_dir" "$gerrit_host" || return 1
+    setup_ssh_auth "$instance_dir" "$gerrit_host" "$remote_ssh_user" "$remote_ssh_port" || return 1
   fi
 
   # Generate replication configuration

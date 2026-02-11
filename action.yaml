@@ -408,10 +408,13 @@ runs:
         echo "  Base: gerritcodereview/gerrit:${GERRIT_VERSION}"
         echo "  Target: ${CUSTOM_IMAGE}"
 
-        if docker build \
+        if docker buildx build \
           --build-arg "GERRIT_VERSION=${GERRIT_VERSION}" \
+          --cache-from type=local,src=/tmp/.buildx-cache \
+          --cache-to type=local,dest=/tmp/.buildx-cache,mode=max \
           -t "${CUSTOM_IMAGE}" \
           -f "${{ github.action_path }}/Dockerfile" \
+          --load \
           "${{ github.action_path }}"; then
           echo "Custom image built successfully ✅"
 
