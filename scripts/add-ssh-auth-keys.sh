@@ -86,6 +86,181 @@ fi
 # Read instances from the tracking file
 INSTANCES_JSON_FILE="$WORK_DIR/instances.json"
 
+# Function to create the internal admin account (ID 1000000) with SSH keys
+# This is needed for cache flushing operations
+create_internal_admin() {
+  local cid="$1"
+
+  echo "  Creating internal admin account for cache operations..."
+
+  # Check if SSH key exists in container (from auth_type=ssh)
+  local ssh_key_path="/var/gerrit/ssh/id_rsa"
+  if ! docker exec "$cid" test -f "$ssh_key_path" 2>/dev/null; then
+    echo "  No SSH key found at $ssh_key_path, generating one..."
+    docker exec "$cid" bash -c '
+      mkdir -p /var/gerrit/ssh
+      ssh-keygen -t ed25519 -f /var/gerrit/ssh/id_rsa -N "" -q
+      chmod 600 /var/gerrit/ssh/id_rsa
+      chmod 644 /var/gerrit/ssh/id_rsa.pub
+    '
+  fi
+
+  # Get the public key
+  local pub_key
+  pub_key=$(docker exec "$cid" cat /var/gerrit/ssh/id_rsa.pub 2>/dev/null || echo "")
+  if [ -z "$pub_key" ]; then
+    echo "::warning::Could not get SSH public key for internal admin"
+    return 1
+  fi
+
+  # Create admin account (ID 1000000) with SSH keys
+  local admin_account_id="1000000"
+  local admin_email="admin@example.com"
+  local admin_fullname="Administrator"
+  local account_shard="00"
+  local account_ref="refs/users/${account_shard}/${admin_account_id}"
+
+  docker exec "$cid" bash -c '
+    cd /tmp
+    rm -rf internal-admin-setup
+    mkdir -p internal-admin-setup
+    cd internal-admin-setup
+
+    git init -q --initial-branch=main admin-repo
+    cd admin-repo
+
+    git config user.email "gerrit@localhost"
+    git config user.name "Gerrit System"
+
+    # Check if account ref exists
+    if git fetch /var/gerrit/git/All-Users.git "'"$account_ref"'":existing 2>/dev/null; then
+      git checkout existing
+      # Update authorized_keys
+      echo "'"$pub_key"'" > authorized_keys
+      git add authorized_keys
+      git commit -m "Update SSH keys for internal admin" --allow-empty
+    else
+      # Create new account
+      cat > account.config <<EOF
+[account]
+  fullName = '"$admin_fullname"'
+  preferredEmail = '"$admin_email"'
+  active = true
+EOF
+      echo "'"$pub_key"'" > authorized_keys
+      git add account.config authorized_keys
+      git commit -m "Create internal admin account"
+    fi
+
+    git push /var/gerrit/git/All-Users.git HEAD:"'"$account_ref"'"
+  ' 2>/dev/null || echo "  Note: Internal admin account may already exist"
+
+  # Register external ID for admin username
+  docker exec "$cid" bash -c '
+    cd /tmp/internal-admin-setup
+    rm -rf extid-repo
+    git init -q --initial-branch=main extid-repo
+    cd extid-repo
+
+    git config user.email "gerrit@localhost"
+    git config user.name "Gerrit System"
+
+    # Fetch existing external-ids or create new
+    if git fetch /var/gerrit/git/All-Users.git refs/meta/external-ids:external-ids 2>/dev/null; then
+      git checkout external-ids
+    else
+      git checkout --orphan external-ids
+      git rm -rf . 2>/dev/null || true
+    fi
+
+    # Create external ID for username:admin
+    EXTERNAL_ID_FILE="username:admin"
+    EXTERNAL_ID_HASH=$(echo -n "$EXTERNAL_ID_FILE" | sha1sum | cut -d" " -f1)
+    EXTERNAL_ID_SHARD="${EXTERNAL_ID_HASH:0:2}"
+
+    mkdir -p "$EXTERNAL_ID_SHARD"
+    cat > "$EXTERNAL_ID_SHARD/$EXTERNAL_ID_HASH" <<EOF
+[externalId "username:admin"]
+  accountId = 1000000
+EOF
+
+    git add .
+    git commit -m "Add external ID for internal admin" --allow-empty
+    git push /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids
+  ' 2>/dev/null || echo "  Note: Admin external ID may already exist"
+
+  # Add admin to Administrators group
+  docker exec "$cid" bash -c '
+    cd /tmp/internal-admin-setup
+    rm -rf group-repo
+    git init -q --initial-branch=main group-repo
+    cd group-repo
+
+    git config user.email "gerrit@localhost"
+    git config user.name "Gerrit System"
+
+    # Fetch group-names to find Administrators UUID
+    if ! git fetch /var/gerrit/git/All-Users.git refs/meta/group-names:group-names 2>/dev/null; then
+      echo "Could not fetch group-names"
+      exit 0
+    fi
+    git checkout group-names
+
+    # Find Administrators group UUID
+    ADMIN_UUID=""
+    for f in *; do
+      if [ -f "$f" ] && grep -q "name = Administrators" "$f" 2>/dev/null; then
+        ADMIN_UUID="$f"
+        break
+      fi
+    done
+
+    if [ -z "$ADMIN_UUID" ]; then
+      echo "Could not find Administrators group"
+      exit 0
+    fi
+
+    # Fetch and update group membership
+    SHARD="${ADMIN_UUID:0:2}"
+    GROUP_REF="refs/groups/$SHARD/$ADMIN_UUID"
+
+    cd /tmp/internal-admin-setup
+    rm -rf members-repo
+    git init -q --initial-branch=main members-repo
+    cd members-repo
+
+    git config user.email "gerrit@localhost"
+    git config user.name "Gerrit System"
+
+    if git fetch /var/gerrit/git/All-Users.git "$GROUP_REF":group-ref 2>/dev/null; then
+      git checkout group-ref
+    else
+      git checkout --orphan group-ref
+      git rm -rf . 2>/dev/null || true
+      cat > group.config <<EOF
+[group]
+  name = Administrators
+  visibleToAll = false
+EOF
+      touch members
+    fi
+
+    # Add account ID 1000000 if not already present
+    if ! grep -q "^1000000$" members 2>/dev/null; then
+      echo "1000000" >> members
+      sort -u members -o members
+      git add .
+      git commit -m "Add internal admin to Administrators" --allow-empty
+      git push /var/gerrit/git/All-Users.git HEAD:"$GROUP_REF"
+    fi
+  ' 2>/dev/null || echo "  Note: Admin may already be in Administrators group"
+
+  # Cleanup
+  docker exec "$cid" rm -rf /tmp/internal-admin-setup 2>/dev/null || true
+
+  echo "  Internal admin account configured ✅"
+}
+
 if [ ! -f "$INSTANCES_JSON_FILE" ]; then
   echo "::error::Instances file not found: $INSTANCES_JSON_FILE"
   exit 1
@@ -278,8 +453,10 @@ for f in *; do
 done
 
 if [ -z "$ADMIN_UUID" ]; then
-  echo "Warning: Could not find Administrators group UUID"
-  exit 0
+  echo "ERROR: Could not find Administrators group UUID"
+  echo "Available group files:"
+  ls -la
+  exit 1
 fi
 
 echo "Found Administrators group UUID: $ADMIN_UUID"
@@ -326,58 +503,66 @@ sort -u members -o members
 git add .
 git commit -m "Add $USERNAME (account $ACCOUNT_ID) to Administrators group" --allow-empty
 
-git push /var/gerrit/git/All-Users.git HEAD:"$GROUP_REF"
+if ! git push /var/gerrit/git/All-Users.git HEAD:"$GROUP_REF"; then
+  echo "ERROR: Failed to push group membership changes"
+  exit 1
+fi
 
 echo "Successfully added $USERNAME to Administrators group"
 ADMIN_SCRIPT_EOF
 
   docker cp "$admin_script" "$cid:/tmp/add-to-admin-group.sh"
   rm -f "$admin_script"
-  docker exec "$cid" bash /tmp/add-to-admin-group.sh "$account_id" "$username" || true
+  if ! docker exec "$cid" bash /tmp/add-to-admin-group.sh "$account_id" "$username"; then
+    echo "::warning::Failed to add user to Administrators group"
+  fi
 }
 
 # Function to flush Gerrit caches
+# Uses the internal admin account with SSH key at /var/gerrit/ssh/id_rsa
 flush_caches() {
   local cid="$1"
 
   echo "  Reloading Gerrit caches..."
 
+  # Use correct SSH key path: /var/gerrit/ssh/id_rsa (not .ssh)
   docker exec "$cid" bash -c '
     # Wait a moment for Gerrit to be ready
     sleep 2
 
-    # Try to flush caches using the Gerrit SSH interface locally
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -p 29418 \
-        -i /var/gerrit/.ssh/id_rsa \
-        admin@localhost \
-        gerrit flush-caches --cache accounts 2>/dev/null || true
+    # SSH key path - check both locations
+    SSH_KEY="/var/gerrit/ssh/id_rsa"
+    if [ ! -f "$SSH_KEY" ]; then
+      SSH_KEY="/var/gerrit/.ssh/id_rsa"
+    fi
+    if [ ! -f "$SSH_KEY" ]; then
+      echo "No SSH key found for cache flushing, skipping..."
+      exit 0
+    fi
 
-    # Also flush external IDs cache
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -p 29418 \
-        -i /var/gerrit/.ssh/id_rsa \
-        admin@localhost \
-        gerrit flush-caches --cache external_ids 2>/dev/null || true
+    # Try to flush all caches at once (most efficient)
+    if ssh -o StrictHostKeyChecking=no \
+           -o UserKnownHostsFile=/dev/null \
+           -o ConnectTimeout=5 \
+           -p 29418 \
+           -i "$SSH_KEY" \
+           admin@localhost \
+           gerrit flush-caches --all 2>/dev/null; then
+      echo "All caches flushed successfully"
+      exit 0
+    fi
 
-    # Flush groups cache
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -p 29418 \
-        -i /var/gerrit/.ssh/id_rsa \
-        admin@localhost \
-        gerrit flush-caches --cache groups 2>/dev/null || true
-
-    # Flush groups_byuuid cache
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -p 29418 \
-        -i /var/gerrit/.ssh/id_rsa \
-        admin@localhost \
-        gerrit flush-caches --cache groups_byuuid 2>/dev/null || true
-  ' || true
+    # If --all failed, try individual caches
+    for cache in accounts external_ids groups groups_byuuid groups_members; do
+      ssh -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          -o ConnectTimeout=5 \
+          -p 29418 \
+          -i "$SSH_KEY" \
+          admin@localhost \
+          gerrit flush-caches --cache "$cache" 2>/dev/null || true
+    done
+  ' || echo "  Note: Cache flush via SSH not available, changes may take effect on next Gerrit restart"
 }
 
 # Process each instance
@@ -393,7 +578,10 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
 
   echo "  Container ID: $cid"
 
-  # Create or update the account
+  # First, ensure internal admin account exists for cache operations
+  create_internal_admin "$cid"
+
+  # Create or update the user account
   create_gerrit_account "$cid" "$ACCOUNT_ID" "$USERNAME" "$FULL_NAME" "$EMAIL"
 
   # Register external ID
