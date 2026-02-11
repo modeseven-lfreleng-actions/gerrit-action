@@ -27,6 +27,7 @@
 # - webhooks
 
 ARG GERRIT_VERSION=3.13.1-ubuntu24
+ARG UV_VERSION=0.10.2
 FROM gerritcodereview/gerrit:${GERRIT_VERSION}
 
 LABEL org.opencontainers.image.title="Gerrit Extended"
@@ -49,9 +50,15 @@ RUN set -eux; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv system-wide
+# Install uv system-wide with version pinning for reproducibility
 # Note: UV_INSTALL_DIR specifies where uv and uvx binaries are placed directly
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+# Using versioned installer URL for security (avoid unverified latest script)
+ARG UV_VERSION
+RUN set -eux; \
+    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/uv-install.sh; \
+    env UV_INSTALL_DIR=/usr/local/bin sh /tmp/uv-install.sh; \
+    rm /tmp/uv-install.sh; \
+    uv --version
 ENV PATH="/usr/local/bin:${PATH}"
 
 # Create a shared tools directory accessible by all users

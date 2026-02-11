@@ -263,17 +263,23 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   echo ""
 
   # Check repository count against expected
+  # Note: Repo count alone is insufficient because start-instances.sh pre-creates
+  # empty bare repos. We must also verify the replication log shows activity.
   if [ "$expected_count" -gt 0 ]; then
     echo "Expected repositories: $expected_count"
-    if [ "$REPO_COUNT" -ge "$expected_count" ]; then
-      echo "✅ Replication complete: $REPO_COUNT/$expected_count repositories"
+    if [ "$REPO_COUNT" -ge "$expected_count" ] && [ "$REPLICATION_STARTED" = true ]; then
+      echo "✅ Replication complete: $REPO_COUNT/$expected_count repositories (log indicates activity)"
+    elif [ "$REPO_COUNT" -ge "$expected_count" ]; then
+      echo "⏳ Repo count matches but awaiting replication log confirmation: $REPO_COUNT/$expected_count"
     elif [ "$REPO_COUNT" -gt 2 ]; then
       echo "⏳ Replication in progress: $REPO_COUNT/$expected_count repositories"
     else
       echo "::warning::Replication may still be starting"
     fi
+  elif [ "$REPO_COUNT" -gt 0 ] && [ "$REPLICATION_STARTED" = true ]; then
+    echo "✅ Replication appears to be working ($REPO_COUNT repositories, log indicates activity)"
   elif [ "$REPO_COUNT" -gt 0 ]; then
-    echo "✅ Replication appears to be working ($REPO_COUNT repositories detected)"
+    echo "⏳ Repositories found ($REPO_COUNT) but awaiting replication log confirmation"
   elif [ "$SYNC_ON_STARTUP" = "true" ]; then
     echo "::warning::No replicated repositories detected"
     echo "Replication may still be in progress"
