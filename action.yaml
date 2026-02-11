@@ -101,6 +101,13 @@ inputs:
     description: "Number of replication threads per instance"
     required: false
     default: '4'
+  max_projects:
+    description: |
+      Maximum number of projects to fetch from remote Gerrit when no
+      project filter is specified. Limits API queries for large instances.
+      Set to a higher value if you need to replicate more projects.
+    required: false
+    default: '500'
   require_replication_success:
     description: |
       If true and sync_on_startup is true, the workflow will fail
@@ -305,6 +312,13 @@ runs:
           exit 1
         fi
 
+        # Validate fetch_every format
+        FETCH_EVERY="${{ inputs.fetch_every }}"
+        if ! [[ "$FETCH_EVERY" =~ ^[0-9]+[smhSMH]?$ ]]; then
+          echo "::error::fetch_every must be a valid interval (e.g., '60s', '5m', '1h', or '0' to disable) ❌"
+          exit 1
+        fi
+
         # Create working directory
         WORK_DIR="/tmp/gerrit-action-$$"
         mkdir -p "$WORK_DIR"
@@ -417,6 +431,7 @@ runs:
         USE_API_PATH: ${{ inputs.use_api_path }}
         TUNNEL_HOST: ${{ inputs.tunnel_host }}
         TUNNEL_PORTS: ${{ inputs.tunnel_ports }}
+        MAX_PROJECTS: ${{ inputs.max_projects }}
       run: |
         # Start Gerrit instances
         set -euo pipefail

@@ -448,7 +448,7 @@ steps:
 <!-- markdownlint-enable MD013 -->
 
 > **Real-world example:** See the tunnel workflow in
-> [`test-gerrit-servers/.github/workflows/`](../test-gerrit-servers/.github/workflows/)
+> [`test-deploy-gerrit`](https://github.com/modeseven-lfreleng-actions/test-deploy-gerrit)
 > for a complete working implementation with multiple tunnel options.
 
 ## Using Repository Variables

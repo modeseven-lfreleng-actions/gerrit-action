@@ -25,8 +25,8 @@ check_plugin_in_logs() {
     return 0
   fi
 
-  # Fallback: check full logs with head to limit output
-  if docker logs "$cid" 2>&1 | head -n 5000 | grep "Loaded plugin $plugin_name" >/dev/null 2>&1; then
+  # Fallback: check a larger window of recent logs without using head to avoid SIGPIPE with pipefail
+  if docker logs --tail 5000 "$cid" 2>&1 | grep "Loaded plugin $plugin_name" >/dev/null 2>&1; then
     return 0
   fi
 
@@ -44,8 +44,8 @@ is_replica_mode() {
     return 0
   fi
 
-  # Fallback: check full logs with head to limit output
-  if docker logs "$cid" 2>&1 | head -n 2000 | grep "\[replica\].*\[headless\]" >/dev/null 2>&1; then
+  # Fallback: check more logs (use --tail to avoid SIGPIPE/pipefail issues)
+  if docker logs --tail 2000 "$cid" 2>&1 | grep "\[replica\].*\[headless\]" >/dev/null 2>&1; then
     return 0
   fi
 
@@ -121,7 +121,7 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
 
     # Show logs for debugging
     echo "Container logs (last 20 lines):"
-    docker logs "$cid" --tail 20 2>&1 || true
+    docker logs --tail 20 "$cid" 2>&1 || true
     continue
   fi
 
@@ -196,7 +196,7 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
       CHECK_FAILED=1
       echo ""
       echo "Container logs (last 50 lines):"
-      docker logs "$cid" --tail 50 2>&1 || true
+      docker logs --tail 50 "$cid" 2>&1 || true
       echo ""
       continue
     fi
@@ -230,7 +230,7 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
       CHECK_FAILED=1
       echo ""
       echo "Container logs (last 50 lines):"
-      docker logs "$cid" --tail 50 2>&1 || true
+      docker logs --tail 50 "$cid" 2>&1 || true
       echo ""
       continue
     fi
@@ -320,7 +320,7 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
         # Show container logs for debugging
         echo ""
         echo "Container logs (last 50 lines):"
-        docker logs "$cid" --tail 50 2>&1 || true
+        docker logs --tail 50 "$cid" 2>&1 || true
         echo ""
       continue
     fi

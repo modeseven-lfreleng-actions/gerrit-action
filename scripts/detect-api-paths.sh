@@ -24,10 +24,26 @@ detect_api_path() {
 
   echo "Detecting API path for: $gerrit_host" >&2
 
-  # If api_path is provided in the config, use it directly
+  # If api_path is provided in the config, normalize and use it
   if [ -n "$provided_api_path" ]; then
-    echo "  Using provided api_path: $provided_api_path" >&2
-    echo "$provided_api_path"
+    local normalized_api_path="$provided_api_path"
+    # Ensure leading slash
+    if [ "${normalized_api_path:0:1}" != "/" ]; then
+      normalized_api_path="/$normalized_api_path"
+    fi
+    # Strip trailing slash
+    normalized_api_path="${normalized_api_path%/}"
+    # Normalize "/" to empty string to avoid double slashes in URLs
+    # Downstream code checks for non-empty api_path and strips slashes,
+    # so "/" would become empty but still trigger the non-empty branch,
+    # producing URLs like "ssh://host//${name}.git" (double slash)
+    if [ "$normalized_api_path" = "/" ]; then
+      normalized_api_path=""
+      echo "  Using provided api_path: (root - normalized to empty)" >&2
+    else
+      echo "  Using provided api_path: $normalized_api_path" >&2
+    fi
+    echo "$normalized_api_path"
     return 0
   fi
 
@@ -46,6 +62,11 @@ detect_api_path() {
     # Extract path from the redirect URL
     # Remove the protocol and host, keep the path
     api_path=$(echo "$redirect_url" | sed -E 's|https?://[^/]+||' | sed 's|/$||')
+
+    # Normalize "/" to empty string to avoid double slashes in URLs
+    if [ "$api_path" = "/" ]; then
+      api_path=""
+    fi
 
     if [ -n "$api_path" ]; then
       echo "  Detected via redirect: $api_path" >&2

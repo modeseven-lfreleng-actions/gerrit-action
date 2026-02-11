@@ -150,23 +150,57 @@ generate_replication_config() {
   local api_path
   api_path=$(get_api_path "$slug")
 
-  # Build the authenticated git-over-https URL
-  # For HTTP Basic auth, Gerrit uses /a/ prefix for authenticated access
-  # URL format: https://<host>/<api_path>/a/${name}.git
+  # Determine authentication type (default to ssh if not set)
+  local auth_type="${AUTH_TYPE:-ssh}"
+  auth_type="${auth_type,,}"
+
+  # Build the replication URL based on auth type
+  # For SSH auth, use Gerrit's SSH endpoint (no /a/ prefix or HTTPS)
+  # For HTTP-based auth (basic, bearer, etc.), use authenticated git-over-https with /a/
   local git_url
-  if [ -n "$api_path" ]; then
-    # Remove leading slash from api_path if present for consistent URL building
-    api_path="${api_path#/}"
-    git_url="https://${gerrit_host}/${api_path}/a/\${name}.git"
+  if [ "$auth_type" = "ssh" ]; then
+    # SSH URL format: ssh://gerrit@<host>/<api_path>/${name}.git
+    if [ -n "$api_path" ]; then
+      # Normalize api_path: strip leading and trailing slashes
+      api_path="${api_path#/}"
+      api_path="${api_path%/}"
+      git_url="ssh://gerrit@${gerrit_host}/${api_path}/\${name}.git"
+    else
+      git_url="ssh://gerrit@${gerrit_host}/\${name}.git"
+    fi
   else
-    git_url="https://${gerrit_host}/a/\${name}.git"
+    # For HTTP Basic/Bearer auth, Gerrit uses /a/ prefix for authenticated access
+    # URL format: https://<host>/<api_path>/a/${name}.git
+    if [ -n "$api_path" ]; then
+      # Normalize api_path: strip leading and trailing slashes
+      api_path="${api_path#/}"
+      api_path="${api_path%/}"
+      git_url="https://${gerrit_host}/${api_path}/a/\${name}.git"
+    else
+      git_url="https://${gerrit_host}/a/\${name}.git"
+    fi
   fi
 
   # Parse sync_refs from environment
   IFS=',' read -ra REFS <<< "$SYNC_REFS"
 
   # Get fetch interval (default to 60s if not set)
+  # 0 or 0 with any unit (0s, 0m, 0h) disables automatic polling
   local fetch_interval="${FETCH_EVERY:-60s}"
+  local fetch_every_enabled=true
+
+  # Validate format first
+  if ! [[ "$fetch_interval" =~ ^[0-9]+[smhSMH]?$ ]]; then
+    echo "::error::Invalid fetch_every value: '$fetch_interval'. Expected format: <integer>[s|m|h], e.g. 60s, 5m, 1h, or 0 to disable" >&2
+    return 1
+  fi
+
+  # Check if fetchEvery should be disabled (0 with any unit means disabled)
+  # Match: 0, 0s, 0S, 0m, 0M, 0h, 0H
+  if [[ "$fetch_interval" =~ ^0[smhSMH]?$ ]]; then
+    fetch_every_enabled=false
+    echo "  fetchEvery disabled (interval set to $fetch_interval)" >&2
+  fi
 
   cat > "$config_file" <<EOF
 # Pull-replication configuration
@@ -191,7 +225,19 @@ generate_replication_config() {
 
 [remote "$slug"]
   url = ${git_url}
-  fetchEvery = ${fetch_interval}
+EOF
+
+  # Add fetchEvery if enabled (not 0/0s)
+  # Must be added before other remote settings
+  if [ "$fetch_every_enabled" = "true" ]; then
+    echo "  fetchEvery = $fetch_interval" >> "$config_file"
+    echo "  Fetch interval (polling): $fetch_interval" >&2
+  else
+    echo "  Automatic polling disabled" >&2
+  fi
+
+  # Continue with remaining remote settings
+  cat >> "$config_file" <<EOF
   timeout = $REPLICATION_TIMEOUT
   connectionTimeout = 120000
   replicationDelay = 0
@@ -202,7 +248,6 @@ generate_replication_config() {
 EOF
 
   echo "  Git URL for replication: $git_url" >&2
-  echo "  Fetch interval (polling): $fetch_interval" >&2
 
   # Note: apiUrl is NOT used because it's mutually exclusive with fetchEvery
   # The fetchEvery setting enables polling-based replication which:
@@ -430,9 +475,14 @@ create_project_directories() {
 
   local projects_to_create=()
 
+  # Configurable limit for project fetching (default: 500)
+  # Set MAX_PROJECTS environment variable to override
+  local max_projects="${MAX_PROJECTS:-500}"
+
   if [ -z "$project" ]; then
     # No specific project filter - fetch ALL projects from remote server
     echo "No project filter specified, fetching project list from remote..."
+    echo "  (Max projects: $max_projects - set MAX_PROJECTS env to override)"
 
     # Get API path for this instance
     local api_path
@@ -440,7 +490,7 @@ create_project_directories() {
 
     # Fetch remote projects
     local remote_projects
-    if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "" 500); then
+    if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "" "$max_projects"); then
       # Convert newline-separated list to array
       while IFS= read -r proj; do
         [ -n "$proj" ] && projects_to_create+=("$proj")
@@ -462,7 +512,7 @@ create_project_directories() {
       api_path=$(get_api_path "$slug")
 
       local remote_projects
-      if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "$project" 500); then
+      if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "$project" "$max_projects"); then
         while IFS= read -r proj; do
           [ -n "$proj" ] && projects_to_create+=("$proj")
         done <<< "$remote_projects"
@@ -488,7 +538,7 @@ create_project_directories() {
     mkdir -p "$project_dir"
     git init --bare "$project_dir" 2>/dev/null || true
     chmod -R 777 "$project_dir"
-    ((created_count++))
+    ((++created_count))
   done
 
   echo "Project directories created: $created_count ✅"
@@ -742,16 +792,17 @@ start_instance() {
   local ssh_host_keys_dir="$WORK_DIR/ssh_host_keys/$slug"
   mkdir -p "$ssh_host_keys_dir"
 
-  echo "Capturing SSH host keys..."
-  # Copy all host key files from the container
-  for key_type in rsa ed25519 ecdsa_256 ecdsa_384 ecdsa_521; do
-    local key_file="ssh_host_${key_type}_key"
-    if docker exec "$cid" test -f "/var/gerrit/etc/${key_file}"; then
-      docker cp "$cid:/var/gerrit/etc/${key_file}" \
-        "$ssh_host_keys_dir/${key_file}" 2>/dev/null || true
-      docker cp "$cid:/var/gerrit/etc/${key_file}.pub" \
-        "$ssh_host_keys_dir/${key_file}.pub" 2>/dev/null || true
-    fi
+  echo "Capturing SSH host public keys..."
+  # Copy only public key files from the container to reduce secret exposure risk
+  # Standard OpenSSH public key names: ssh_host_rsa_key.pub, ssh_host_ecdsa_key.pub, ssh_host_ed25519_key.pub
+  # Private keys are not needed - we only use public keys for known_hosts
+  local pub_key_files
+  pub_key_files=$(docker exec "$cid" sh -c 'ls /var/gerrit/etc/ssh_host_*_key.pub 2>/dev/null' || echo "")
+  for pub_key_path in $pub_key_files; do
+    local pub_key_file
+    pub_key_file=$(basename "$pub_key_path")
+    docker cp "$cid:/var/gerrit/etc/${pub_key_file}" \
+      "$ssh_host_keys_dir/${pub_key_file}" 2>/dev/null || true
   done
 
   # Build SSH host public keys JSON for this instance

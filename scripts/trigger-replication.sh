@@ -29,17 +29,25 @@ echo ""
 FETCH_EVERY="${FETCH_EVERY:-60s}"
 
 # Function to parse time interval to seconds
-# Supports: 60s, 5m, 1h, etc.
+# Supports: 60s, 5m, 1h, or plain seconds (e.g., 60)
 parse_interval_to_seconds() {
   local interval="$1"
-  local value="${interval%[smhSMH]}"
-  local unit="${interval: -1}"
+  local value
+  local unit
+
+  # Validate format: integer with optional s/m/h suffix
+  if [[ "$interval" =~ ^([0-9]+)([smhSMH]?)$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+  else
+    echo "Invalid FETCH_EVERY value: '$interval'. Expected format: <integer>[s|m|h], e.g. 60s, 5m, 1h." >&2
+    return 1
+  fi
 
   case "$unit" in
-    s|S) echo "$value" ;;
-    m|M) echo $((value * 60)) ;;
-    h|H) echo $((value * 3600)) ;;
-    *)   echo "$value" ;;  # Assume seconds if no unit
+    ""|s|S) echo "$value" ;;
+    m|M)    echo $((value * 60)) ;;
+    h|H)    echo $((value * 3600)) ;;
   esac
 }
 
@@ -68,8 +76,8 @@ check_plugin_in_logs() {
     return 0
   fi
 
-  # Fallback: check full logs with head to limit output
-  if docker logs "$cid" 2>&1 | head -n 5000 | grep "Loaded plugin $plugin_name" >/dev/null 2>&1; then
+  # Fallback: check a larger window of recent logs without using head to avoid SIGPIPE with pipefail
+  if docker logs --tail 5000 "$cid" 2>&1 | grep "Loaded plugin $plugin_name" >/dev/null 2>&1; then
     return 0
   fi
 
@@ -119,7 +127,7 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
       echo "Pull-replication plugin is active ✅"
 
       # Show the plugin version from logs
-      PLUGIN_VERSION_LOG=$(docker logs "$cid" 2>&1 | \
+      PLUGIN_VERSION_LOG=$(docker logs --tail 200 "$cid" 2>&1 | \
         grep "Loaded plugin pull-replication" | tail -1 || echo "")
       if [ -n "$PLUGIN_VERSION_LOG" ]; then
         echo "  $PLUGIN_VERSION_LOG"
@@ -187,8 +195,10 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
 
   while [ $WAITED -lt $MAX_WAIT ]; do
     # Check pull_replication_log for activity
+    # Use tail -n 50 instead of cat to avoid reading the entire log file each iteration
+    # This is more efficient for large replications where the log can grow quickly
     if docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
-      REPL_LOG_CONTENT=$(docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "")
+      REPL_LOG_CONTENT=$(docker exec "$cid" tail -n 50 /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "")
       if [ -n "$REPL_LOG_CONTENT" ]; then
         REPLICATION_STARTED=true
         # Check if replication completed
@@ -214,15 +224,15 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
     echo "Replication will continue in the background via fetchEvery polling"
   fi
 
-  # Show pull_replication_log content
+  # Show pull_replication_log content (last 20 lines to avoid flooding CI logs)
   echo ""
-  echo "Pull replication log:"
-  docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "(empty)"
+  echo "Pull replication log (last 20 lines):"
+  docker exec "$cid" tail -20 /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "(empty)"
   echo ""
 
   # Check container logs for any replication-related messages
   echo "Container log replication activity:"
-  docker logs "$cid" 2>&1 | \
+  docker logs --tail 5000 "$cid" 2>&1 | \
     grep -iE "pull-replication|fetch|FetchAll" | tail -10 || echo "(none)"
   echo ""
 
@@ -233,11 +243,18 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
 
   echo "Repositories in git directory: $REPO_COUNT"
 
-  # List repositories
+  # List repositories (limit output to avoid flooding CI logs)
   echo ""
   echo "Repositories:"
-  docker exec "$cid" sh -c \
-    "find /var/gerrit/git -name '*.git' -type d 2>/dev/null" || true
+  if [ "${DEBUG:-false}" = "true" ]; then
+    echo "  (DEBUG=true: showing full repository list)"
+    docker exec "$cid" sh -c \
+      "find /var/gerrit/git -name '*.git' -type d 2>/dev/null" || true
+  else
+    echo "  (showing first 50 repositories; set DEBUG=true for full list)"
+    docker exec "$cid" sh -c \
+      "find /var/gerrit/git -name '*.git' -type d 2>/dev/null | head -50" || true
+  fi
   echo ""
 
   # Check if repos have actual content (packed-refs indicates successful fetch)

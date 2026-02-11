@@ -42,6 +42,7 @@ CONTAINER_NAME="gerrit-local-test"
 HTTP_PORT="${HTTP_PORT:-8080}"
 SSH_PORT="${SSH_PORT:-29418}"
 FETCH_EVERY="${FETCH_EVERY:-60s}"
+FETCH_EVERY_ENABLED=true
 # REPLICA_MODE: Set to 'true' to use replica mode (disables web UI)
 # Default is 'false' for fetchEvery polling mode (web UI enabled)
 REPLICA_MODE="${REPLICA_MODE:-false}"
@@ -111,6 +112,17 @@ log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+# Validate and check if fetchEvery should be disabled
+# 0 or 0 with any unit (0s, 0m, 0h) disables automatic polling
+if ! [[ "$FETCH_EVERY" =~ ^[0-9]+[smhSMH]?$ ]]; then
+  log_error "Invalid FETCH_EVERY value: '$FETCH_EVERY'. Expected format: <integer>[s|m|h], e.g. 60s, 5m, 1h, or 0 to disable"
+  exit 1
+fi
+if [[ "$FETCH_EVERY" =~ ^0[smhSMH]?$ ]]; then
+  FETCH_EVERY_ENABLED=false
+  log_warn "fetchEvery disabled (interval set to $FETCH_EVERY)"
+fi
 
 # Load .env file if it exists
 if [ -f ".env" ]; then
@@ -318,7 +330,7 @@ else
 
 [remote "source"]
   url = ${GIT_URL}
-  fetchEvery = ${FETCH_EVERY}
+$( [ "$FETCH_EVERY_ENABLED" = "true" ] && echo "  fetchEvery = ${FETCH_EVERY}" )
   timeout = 600
   connectionTimeout = 120000
   replicationDelay = 0

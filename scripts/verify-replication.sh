@@ -50,9 +50,9 @@ check_plugin_loaded() {
     return 0
   fi
 
-  # Method 2: Check full logs with timeout to avoid hanging on large log output
-  # Use head to limit output and prevent pipe buffer issues
-  if timeout 10 docker logs "$cid" 2>&1 | head -n 5000 | grep "Loaded plugin pull-replication" >/dev/null 2>&1; then
+  # Method 2: Check logs with timeout to avoid hanging on large log output
+  # Use docker logs --tail to limit output and avoid SIGPIPE/pipefail issues from head
+  if timeout 10 docker logs --tail 5000 "$cid" 2>&1 | grep "Loaded plugin pull-replication" >/dev/null 2>&1; then
     return 0
   fi
 
@@ -73,16 +73,13 @@ check_replication_errors() {
   local cid="$1"
 
   # First check pull_replication_log - this is the definitive source
+  # Use tail and grep inside the container to avoid reading entire log into memory
+  # This function is called frequently in wait_for_replication, so efficiency matters
   if docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
-    local repl_log
-    repl_log=$(docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "")
-
-    if [ -n "$repl_log" ]; then
-      # Check for explicit failure patterns in pull_replication_log
-      # Use grep without -q and redirect output to avoid broken pipe errors
-      if printf '%s\n' "$repl_log" 2>/dev/null | grep -iE "Cannot replicate|TransportException|git-upload-pack not permitted|Authentication.*failed|Permission denied|Connection refused|error|failed|Exception" >/dev/null 2>&1; then
-        return 0  # Found errors
-      fi
+    # Run tail and grep inside the container to check for error patterns
+    # Using tail -n 500 to scan recent log entries without loading the entire file
+    if docker exec "$cid" sh -c "tail -n 500 /var/gerrit/logs/pull_replication_log 2>/dev/null | grep -iE 'Cannot replicate|TransportException|git-upload-pack not permitted|Authentication.*failed|Permission denied|Connection refused|error|failed|Exception'" >/dev/null 2>&1; then
+      return 0  # Found errors
     fi
   fi
 
@@ -119,9 +116,11 @@ check_pull_replication_log() {
   local cid="$1"
 
   # Check if the log file exists and has content
+  # Use tail -n 100 instead of cat to avoid reading the entire log file each iteration
+  # This function is called in a tight polling loop, so efficiency matters as the log grows
   if docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
     local log_content
-    log_content=$(docker exec "$cid" cat /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "")
+    log_content=$(docker exec "$cid" tail -n 100 /var/gerrit/logs/pull_replication_log 2>/dev/null || echo "")
 
     if [ -n "$log_content" ]; then
       # FIRST check for errors - these take priority
@@ -181,35 +180,48 @@ check_project_replicated() {
 }
 
 # Function to verify repos have actual content (not just empty pre-created dirs)
+# Uses a single docker exec call to count repos efficiently
 verify_repos_have_content() {
   local cid="$1"
 
-  # Count repos that have either packed-refs or refs/heads content
-  local repos_with_content=0
-  local total_repos=0
+  # Run all counting inside the container in a single exec call
+  # This avoids multiple docker exec calls per repository which is slow
+  local result
+  result=$(docker exec "$cid" sh -c '
+    repos_with_content=0
+    total_repos=0
 
-  while IFS= read -r repo_path; do
-    [ -z "$repo_path" ] && continue
-    # Skip All-Projects and All-Users
-    if [[ "$repo_path" == *"All-Projects"* ]] || [[ "$repo_path" == *"All-Users"* ]]; then
-      continue
-    fi
+    for repo_path in $(find /var/gerrit/git -name "*.git" -type d 2>/dev/null); do
+      # Skip All-Projects and All-Users
+      case "$repo_path" in
+        *All-Projects*|*All-Users*) continue ;;
+      esac
 
-    total_repos=$((total_repos + 1))
+      total_repos=$((total_repos + 1))
 
-    # Check for packed-refs
-    if docker exec "$cid" test -f "$repo_path/packed-refs" 2>/dev/null; then
-      repos_with_content=$((repos_with_content + 1))
-      continue
-    fi
+      # Check for packed-refs
+      if [ -f "$repo_path/packed-refs" ]; then
+        repos_with_content=$((repos_with_content + 1))
+        continue
+      fi
 
-    # Check for refs/heads content
-    local head_count
-    head_count=$(docker exec "$cid" sh -c "find '$repo_path/refs/heads' -type f 2>/dev/null | wc -l" || echo "0")
-    if [ "$head_count" -gt 0 ]; then
-      repos_with_content=$((repos_with_content + 1))
-    fi
-  done < <(docker exec "$cid" find /var/gerrit/git -name '*.git' -type d 2>/dev/null)
+      # Check for refs/heads content
+      head_count=$(find "$repo_path/refs/heads" -type f 2>/dev/null | wc -l)
+      if [ "$head_count" -gt 0 ]; then
+        repos_with_content=$((repos_with_content + 1))
+      fi
+    done
+
+    echo "$repos_with_content $total_repos"
+  ' 2>/dev/null) || result="0 0"
+
+  local repos_with_content total_repos
+  repos_with_content=$(echo "$result" | awk '{print $1}')
+  total_repos=$(echo "$result" | awk '{print $2}')
+
+  # Handle empty/invalid results
+  repos_with_content="${repos_with_content:-0}"
+  total_repos="${total_repos:-0}"
 
   echo "$repos_with_content/$total_repos"
 
