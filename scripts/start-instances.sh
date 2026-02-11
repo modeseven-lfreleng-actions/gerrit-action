@@ -218,7 +218,11 @@ fetch_remote_projects() {
   }
 
   local count
-  count=$(echo "$projects" | grep -c . || echo "0")
+  # Count projects with robust integer validation
+  count=$(echo "$projects" | grep -c . 2>/dev/null || echo "0")
+  # Ensure count is a valid integer (strip non-digits, default to 0)
+  count="${count//[^0-9]/}"
+  count="${count:-0}"
   echo "  Found $count projects on remote server" >&2
 
   # Return project list (one per line)
@@ -462,8 +466,10 @@ init_gerrit_site() {
   local GERRIT_GID=1000
 
   mkdir -p "$instance_dir"/{git,cache,index,data,etc,logs,plugins,tmp}
-  chown -R "$GERRIT_UID:$GERRIT_GID" "$instance_dir"
-  chmod -R 755 "$instance_dir"
+  # Set proper ownership for Gerrit user - suppress errors if running as non-root
+  # The Docker container will handle ownership via its entrypoint if needed
+  chown -R "$GERRIT_UID:$GERRIT_GID" "$instance_dir" 2>/dev/null || true
+  chmod -R 755 "$instance_dir" 2>/dev/null || true
 
   # Run Gerrit init using the container's entrypoint
   # Mount only specific subdirectories to avoid hiding /var/gerrit/bin
@@ -655,8 +661,9 @@ fetch_expected_project_count() {
       mkdir -p "$project_dir"
       git init --bare "$project_dir" >/dev/null 2>&1
       # Set proper ownership for Gerrit user (UID:GID 1000:1000)
-      chown -R 1000:1000 "$project_dir"
-      chmod -R 755 "$project_dir"
+      # Suppress errors when running as non-root on GitHub Actions runners
+      chown -R 1000:1000 "$project_dir" 2>/dev/null || true
+      chmod -R 755 "$project_dir" 2>/dev/null || true
       created_count=$((created_count + 1))
     fi
   done
@@ -959,20 +966,21 @@ start_instance() {
   done
 
   # Build SSH host public keys JSON for this instance
-  local ssh_host_pub_keys=""
+  # Use jq to safely construct JSON and handle special characters in keys
+  local ssh_host_pub_keys="{}"
   for pub_key_file in "$ssh_host_keys_dir"/*.pub; do
     if [ -f "$pub_key_file" ]; then
       local key_name
       key_name=$(basename "$pub_key_file" .pub)
       local key_content
       key_content=$(tr -d '\n' < "$pub_key_file")
-      if [ -n "$ssh_host_pub_keys" ]; then
-        ssh_host_pub_keys="${ssh_host_pub_keys},"
-      fi
-      ssh_host_pub_keys="${ssh_host_pub_keys}\"${key_name}\":\"${key_content}\""
+      # Use jq to safely add each key-value pair to the JSON object
+      ssh_host_pub_keys=$(echo "$ssh_host_pub_keys" | jq \
+        --arg name "$key_name" \
+        --arg content "$key_content" \
+        '. + {($name): $content}')
     fi
   done
-  ssh_host_pub_keys="{${ssh_host_pub_keys}}"
   echo "  SSH host keys captured ✅"
 
   # Read expected project count from earlier step

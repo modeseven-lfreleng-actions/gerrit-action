@@ -219,7 +219,7 @@ The `gerrit_setup` input accepts a JSON array of instance configurations:
   {
     "slug": "opendaylight",
     "gerrit": "git.opendaylight.org",
-    "project": "releng/.*",
+    "project": "regex:releng/.*",
     "api_path": "/gerrit",
     "ssh_user": "replication-bot",
     "ssh_port": "29418"

@@ -94,20 +94,20 @@ create_internal_admin() {
   echo "  Creating internal admin account for cache operations..."
 
   # Check if SSH key exists in container (from auth_type=ssh)
-  local ssh_key_path="/var/gerrit/ssh/id_rsa"
+  local ssh_key_path="/var/gerrit/ssh/id_ed25519"
   if ! docker exec "$cid" test -f "$ssh_key_path" 2>/dev/null; then
     echo "  No SSH key found at $ssh_key_path, generating one..."
     docker exec "$cid" bash -c '
       mkdir -p /var/gerrit/ssh
-      ssh-keygen -t ed25519 -f /var/gerrit/ssh/id_rsa -N "" -q
-      chmod 600 /var/gerrit/ssh/id_rsa
-      chmod 644 /var/gerrit/ssh/id_rsa.pub
+      ssh-keygen -t ed25519 -f /var/gerrit/ssh/id_ed25519 -N "" -q
+      chmod 600 /var/gerrit/ssh/id_ed25519
+      chmod 644 /var/gerrit/ssh/id_ed25519.pub
     '
   fi
 
   # Get the public key
   local pub_key
-  pub_key=$(docker exec "$cid" cat /var/gerrit/ssh/id_rsa.pub 2>/dev/null || echo "")
+  pub_key=$(docker exec "$cid" cat /var/gerrit/ssh/id_ed25519.pub 2>/dev/null || echo "")
   if [ -z "$pub_key" ]; then
     echo "::warning::Could not get SSH public key for internal admin"
     return 1
@@ -156,7 +156,10 @@ EOF
   ' 2>/dev/null || echo "  Note: Internal admin account may already exist"
 
   # Register external ID for admin username
+  # This links the username "admin" to account 1000000
+  echo "  Registering external ID for admin username..."
   docker exec "$cid" bash -c '
+    set -e
     cd /tmp/internal-admin-setup
     rm -rf extid-repo
     git init -q --initial-branch=main extid-repo
@@ -168,15 +171,20 @@ EOF
     # Fetch existing external-ids or create new
     if git fetch /var/gerrit/git/All-Users.git refs/meta/external-ids:external-ids 2>/dev/null; then
       git checkout external-ids
+      echo "  Fetched existing external-ids ref"
     else
       git checkout --orphan external-ids
       git rm -rf . 2>/dev/null || true
+      echo "  Created new external-ids ref"
     fi
 
     # Create external ID for username:admin
+    # The filename is the SHA-1 hash of the external ID string
     EXTERNAL_ID_FILE="username:admin"
     EXTERNAL_ID_HASH=$(echo -n "$EXTERNAL_ID_FILE" | sha1sum | cut -d" " -f1)
     EXTERNAL_ID_SHARD="${EXTERNAL_ID_HASH:0:2}"
+
+    echo "  External ID hash: $EXTERNAL_ID_HASH (shard: $EXTERNAL_ID_SHARD)"
 
     mkdir -p "$EXTERNAL_ID_SHARD"
     cat > "$EXTERNAL_ID_SHARD/$EXTERNAL_ID_HASH" <<EOF
@@ -184,10 +192,33 @@ EOF
   accountId = 1000000
 EOF
 
+    echo "  Created external ID file: $EXTERNAL_ID_SHARD/$EXTERNAL_ID_HASH"
+    cat "$EXTERNAL_ID_SHARD/$EXTERNAL_ID_HASH"
+
     git add .
+    git status
     git commit -m "Add external ID for internal admin" --allow-empty
-    git push /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids
-  ' 2>/dev/null || echo "  Note: Admin external ID may already exist"
+
+    echo "  Pushing external-ids ref..."
+    if git push /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids; then
+      echo "  External ID for admin pushed successfully"
+    else
+      echo "  Push failed, trying force push..."
+      git push --force /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids
+    fi
+
+    # Verify the external ID was written
+    echo "  Verifying external ID in repository..."
+    cd /tmp/internal-admin-setup
+    rm -rf verify-extid
+    git clone --bare /var/gerrit/git/All-Users.git verify-extid 2>/dev/null
+    cd verify-extid
+    git show refs/meta/external-ids:"$EXTERNAL_ID_SHARD/$EXTERNAL_ID_HASH" 2>/dev/null && echo "  Verified: admin external ID exists" || echo "  WARNING: admin external ID not found!"
+  '
+  local admin_extid_result=$?
+  if [ $admin_extid_result -ne 0 ]; then
+    echo "::warning::Failed to register external ID for admin"
+  fi
 
   # Add admin to Administrators group
   docker exec "$cid" bash -c '
@@ -365,6 +396,7 @@ register_external_id() {
   echo "  Registering external ID for username: $username..."
 
   # Create the external-ids script
+  # This script carefully preserves existing external IDs while adding the new one
   local extid_script
   extid_script=$(mktemp)
   cat > "$extid_script" << EXTID_SCRIPT_EOF
@@ -378,35 +410,63 @@ cd accounts-repo
 git config user.email "$email"
 git config user.name "$full_name"
 
-# Try to fetch existing external-ids ref
-if git fetch /var/gerrit/git/All-Users.git refs/meta/external-ids:external-ids 2>/dev/null; then
-  git checkout external-ids
-else
-  # Create new external-ids tracking
-  git checkout --orphan external-ids
-  git rm -rf . 2>/dev/null || true
-fi
+# Retry loop to handle concurrent updates
+MAX_RETRIES=3
+RETRY=0
+while [ \$RETRY -lt \$MAX_RETRIES ]; do
+  # Always fetch the latest external-ids ref
+  rm -rf .git/refs/heads/* 2>/dev/null || true
+  if git fetch /var/gerrit/git/All-Users.git refs/meta/external-ids:external-ids 2>/dev/null; then
+    git checkout -f external-ids
+    git clean -fd
+  else
+    # Create new external-ids tracking if it doesn't exist
+    git checkout --orphan external-ids
+    git rm -rf . 2>/dev/null || true
+  fi
 
-# Create external ID file for username
-EXTERNAL_ID_FILE="username:$username"
-EXTERNAL_ID_HASH=\$(echo -n "\$EXTERNAL_ID_FILE" | sha1sum | cut -d' ' -f1)
-EXTERNAL_ID_SHARD="\${EXTERNAL_ID_HASH:0:2}"
+  # Create external ID file for username
+  EXTERNAL_ID_FILE="username:$username"
+  EXTERNAL_ID_HASH=\$(echo -n "\$EXTERNAL_ID_FILE" | sha1sum | cut -d' ' -f1)
+  EXTERNAL_ID_SHARD="\${EXTERNAL_ID_HASH:0:2}"
 
-mkdir -p "\$EXTERNAL_ID_SHARD"
-cat > "\$EXTERNAL_ID_SHARD/\$EXTERNAL_ID_HASH" <<EOF
+  mkdir -p "\$EXTERNAL_ID_SHARD"
+  # External ID must include accountId to link username to account
+  cat > "\$EXTERNAL_ID_SHARD/\$EXTERNAL_ID_HASH" <<EOF
 [externalId "username:$username"]
   accountId = $account_id
 EOF
 
-git add .
-git commit -m "Add external ID for $username" --allow-empty
+  git add .
+  git commit -m "Add external ID for $username" --allow-empty
 
-# Force push to handle potential conflicts with concurrent updates
-if ! git push --force /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids; then
-  echo "ERROR: Failed to push external ID for $username"
-  exit 1
-fi
-echo "External ID registered successfully for $username"
+  # Try to push (without force first to detect conflicts)
+  if git push /var/gerrit/git/All-Users.git HEAD:refs/meta/external-ids 2>/dev/null; then
+    echo "External ID registered successfully for $username"
+
+    # Verify the external ID was written correctly
+    cd /tmp/account-setup
+    rm -rf verify-repo
+    git init -q verify-repo
+    cd verify-repo
+    git fetch /var/gerrit/git/All-Users.git refs/meta/external-ids:verify 2>/dev/null
+    git checkout verify
+    if grep -r "username:$username" . >/dev/null 2>&1; then
+      echo "  Verified: external ID for $username exists in NoteDb"
+    else
+      echo "  WARNING: external ID for $username not found after push!"
+    fi
+    exit 0
+  fi
+
+  # Push failed - likely a concurrent update, retry
+  RETRY=\$((RETRY + 1))
+  echo "  Push conflict, retrying (\$RETRY/\$MAX_RETRIES)..."
+  sleep 1
+done
+
+echo "ERROR: Failed to push external ID for $username after \$MAX_RETRIES retries"
+exit 1
 EXTID_SCRIPT_EOF
 
   docker cp "$extid_script" "$cid:/tmp/register-external-ids.sh"
@@ -525,69 +585,154 @@ ADMIN_SCRIPT_EOF
   fi
 }
 
-# Function to flush Gerrit caches
-# Uses the internal admin account with SSH key at /var/gerrit/ssh/id_rsa
+# Function to reload Gerrit caches by clearing disk cache and restarting container
+# Direct restart is the most reliable way to ensure Gerrit picks up NoteDb changes
+# HTTP/SSH cache flush methods don't work during initial setup (chicken-and-egg problem)
 flush_caches() {
   local cid="$1"
+  local api_path="${2:-}"  # Optional API path (e.g., /r) for context-path deployments
 
   echo "  Reloading Gerrit caches..."
 
-  # Try HTTP-based cache flush first (works with DEVELOPMENT_BECOME_ANY_ACCOUNT)
-  # This is more reliable than SSH as it doesn't require internal admin account setup
+  # Clear ALL disk caches and indexes BEFORE restart to force Gerrit to rebuild from NoteDb
+  # This is critical - if stale cache/index data exists, username lookups fail
+  echo "  Clearing Gerrit disk cache and indexes..."
   docker exec "$cid" bash -c '
-    # Wait a moment for Gerrit to be ready
-    sleep 2
+    echo "  Clearing H2 cache database files..."
+    rm -rf /var/gerrit/cache/*.h2.db 2>/dev/null || true
+    rm -rf /var/gerrit/cache/*.lock 2>/dev/null || true
 
-    # Get a session by "becoming" account 1000000 (internal admin)
-    # In DEVELOPMENT_BECOME_ANY_ACCOUNT mode, this gives us admin access
-    SESSION_COOKIE=$(curl -s -c - "http://localhost:8080/login/?account_id=1000000" 2>/dev/null | grep GerritAccount | awk "{print \$7}")
-    XSRF_TOKEN=$(curl -s -c - "http://localhost:8080/login/?account_id=1000000" 2>/dev/null | grep XSRF_TOKEN | awk "{print \$7}")
+    echo "  Clearing specific cache types..."
+    rm -rf /var/gerrit/cache/accounts* 2>/dev/null || true
+    rm -rf /var/gerrit/cache/external_ids* 2>/dev/null || true
+    rm -rf /var/gerrit/cache/groups* 2>/dev/null || true
+    rm -rf /var/gerrit/cache/ldap* 2>/dev/null || true
+    rm -rf /var/gerrit/cache/sshkeys* 2>/dev/null || true
+    rm -rf /var/gerrit/cache/web_sessions* 2>/dev/null || true
 
-    if [ -n "$SESSION_COOKIE" ] && [ -n "$XSRF_TOKEN" ]; then
-      echo "Using HTTP API to flush caches..."
-      for cache in accounts external_ids groups groups_byuuid groups_members; do
-        curl -s -X POST \
-          -b "GerritAccount=$SESSION_COOKIE" \
-          -H "X-Gerrit-Auth: $XSRF_TOKEN" \
-          "http://localhost:8080/a/config/server/caches/$cache/flush" 2>/dev/null || true
-      done
-      echo "HTTP cache flush completed"
-      exit 0
+    echo "  Clearing account and external ID indexes..."
+    rm -rf /var/gerrit/index/accounts_* 2>/dev/null || true
+    rm -rf /var/gerrit/index/groups_* 2>/dev/null || true
+
+    echo "  Verifying external IDs in NoteDb before restart..."
+    cd /tmp && rm -rf verify-extids 2>/dev/null
+    git clone --bare /var/gerrit/git/All-Users.git verify-extids 2>/dev/null || true
+    if [ -d verify-extids ]; then
+      cd verify-extids
+      echo "  External IDs in refs/meta/external-ids:"
+      git ls-tree refs/meta/external-ids 2>/dev/null | head -10 || echo "  (none found)"
+      echo "  Looking for username external IDs..."
+      git show refs/meta/external-ids 2>/dev/null | grep -r "externalId.*username" || echo "  (no username external IDs found in tree)"
+      cd /tmp && rm -rf verify-extids
     fi
 
-    # Fall back to SSH-based cache flush
-    SSH_KEY="/var/gerrit/ssh/id_rsa"
-    if [ ! -f "$SSH_KEY" ]; then
-      SSH_KEY="/var/gerrit/.ssh/id_rsa"
-    fi
-    if [ ! -f "$SSH_KEY" ]; then
-      echo "No SSH key found for cache flushing, skipping..."
-      exit 0
-    fi
+    echo "  Cache and index files cleared"
+    echo "  Remaining cache files:"
+    ls -la /var/gerrit/cache/ 2>/dev/null | head -10 || echo "  (cache directory empty)"
+    echo "  Index directory:"
+    ls -la /var/gerrit/index/ 2>/dev/null | head -10 || echo "  (index directory empty)"
+  ' || echo "  Note: Some cache/index files may not exist yet"
 
-    # Try to flush all caches at once (most efficient)
-    if ssh -o StrictHostKeyChecking=no \
-           -o UserKnownHostsFile=/dev/null \
-           -o ConnectTimeout=5 \
-           -p 29418 \
-           -i "$SSH_KEY" \
-           admin@localhost \
-           gerrit flush-caches --all 2>/dev/null; then
-      echo "All caches flushed successfully via SSH"
-      exit 0
-    fi
+  echo "  Restarting Gerrit container..."
+  if docker restart "$cid" >/dev/null 2>&1; then
+    echo "  Container restarted, waiting for Gerrit to be ready..."
+    # Wait for Gerrit to be ready again using multiple detection methods
+    local max_wait=180  # Increased timeout for large repos
+    local waited=0
+    local ready=0
+    # Build health check URL with optional API path
+    local health_url="http://localhost:8080${api_path}/config/server/version"
 
-    # If --all failed, try individual caches
-    for cache in accounts external_ids groups groups_byuuid groups_members; do
-      ssh -o StrictHostKeyChecking=no \
-          -o UserKnownHostsFile=/dev/null \
-          -o ConnectTimeout=5 \
-          -p 29418 \
-          -i "$SSH_KEY" \
-          admin@localhost \
-          gerrit flush-caches --cache "$cache" 2>/dev/null || true
+    while [ $waited -lt $max_wait ]; do
+      # Method 1: HTTP health check (most reliable when working)
+      local http_code
+      http_code=$(docker exec "$cid" curl -s -o /dev/null -w "%{http_code}" "$health_url" 2>/dev/null || echo "000")
+      if [ "$http_code" = "200" ]; then
+        echo "  Gerrit is ready (HTTP check) ✅"
+        ready=1
+        break
+      fi
+
+      # Method 2: Check for "Gerrit Code Review" ready message in logs
+      if docker logs --tail 100 "$cid" 2>&1 | grep -q "Gerrit Code Review .* ready"; then
+        # Also verify the HTTP port is responding (even if not 200)
+        if [ "$http_code" != "000" ]; then
+          echo "  Gerrit is ready (log check + HTTP responding) ✅"
+          ready=1
+          break
+        fi
+      fi
+
+      # Method 3: Check if SSH port is responding (Gerrit is mostly ready)
+      if docker exec "$cid" bash -c "echo | nc -w1 localhost 29418" >/dev/null 2>&1; then
+        # SSH is up, Gerrit is likely ready enough for our purposes
+        if [ $waited -ge 30 ]; then
+          echo "  Gerrit SSH port ready, proceeding ✅"
+          ready=1
+          break
+        fi
+      fi
+
+      sleep 2
+      waited=$((waited + 2))
+      if [ $((waited % 10)) -eq 0 ]; then
+        echo "    Waiting... ${waited}s (HTTP: $http_code)"
+      fi
     done
-  ' || echo "  Note: Cache flush not available, changes may take effect on next Gerrit restart"
+
+    if [ $ready -eq 0 ]; then
+      echo "::warning::Gerrit health check did not succeed within ${max_wait}s"
+      echo "  Note: Gerrit may still be functional, continuing..."
+    fi
+  else
+    echo "::warning::Failed to restart container"
+    # Continue anyway - Gerrit might still work
+  fi
+
+  # Verify external ID is now visible via API after restart
+  echo "  Verifying external ID is visible via API..."
+  sleep 2  # Give Gerrit a moment to fully initialize
+  local account_url="http://localhost:8080${api_path}/accounts/$USERNAME"
+  # Get API response and count matches, with robust integer validation
+  # The grep -c command may output non-integer values in edge cases
+  local api_response
+  api_response=$(docker exec "$cid" curl -s "$account_url" 2>/dev/null || echo "")
+  local API_CHECK
+  API_CHECK=$(printf '%s' "$api_response" | grep -c "_account_id" 2>/dev/null || echo "0")
+  # Strip any non-digit characters and ensure we have a valid integer
+  API_CHECK="${API_CHECK//[^0-9]/}"
+  API_CHECK="${API_CHECK:-0}"
+  if [ "$API_CHECK" -gt 0 ]; then
+    echo "  External ID visible via API ✅"
+  else
+    # Check if it exists in NoteDb at least
+    EXTID_EXISTS=$(docker exec "$cid" bash -c '
+      cd /tmp
+      rm -rf extid-check
+      git init -q extid-check
+      cd extid-check
+      if git fetch /var/gerrit/git/All-Users.git refs/meta/external-ids:extids 2>/dev/null; then
+        git checkout extids
+        if grep -rq "username:'"$USERNAME"'" . 2>/dev/null; then
+          echo "found"
+        else
+          echo "not_found"
+        fi
+      else
+        echo "no_ref"
+      fi
+      cd /tmp && rm -rf extid-check
+    ' 2>/dev/null || echo "error")
+
+    if [ "$EXTID_EXISTS" = "found" ]; then
+      echo "::warning::External ID exists in NoteDb but not visible via API"
+      echo "::warning::SSH authentication may not work until Gerrit fully loads"
+    elif [ "$EXTID_EXISTS" = "not_found" ]; then
+      echo "::error::External ID for $USERNAME not found in NoteDb - registration failed"
+    else
+      echo "::warning::Could not verify external ID status"
+    fi
+  fi
 }
 
 # Process each instance
@@ -615,8 +760,15 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   # Add user to Administrators group for full create/merge permissions
   add_to_administrators_group "$cid" "$ACCOUNT_ID" "$USERNAME"
 
+  # Get API path for this instance (for context-path deployments like /r)
+  api_path=$(jq -r ".\"$slug\".api_path // \"\"" "$INSTANCES_JSON_FILE")
+  effective_api_path=""
+  if [ "${USE_API_PATH:-false}" = "true" ] && [ -n "$api_path" ]; then
+    effective_api_path="$api_path"
+  fi
+
   # Flush caches
-  flush_caches "$cid"
+  flush_caches "$cid" "$effective_api_path"
 
   # Clean up
   docker exec "$cid" rm -rf /tmp/account-setup /tmp/authorized_keys_input 2>/dev/null || true
@@ -624,11 +776,11 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   echo "  SSH keys added ✅"
 
   # Display the keys that were added
-  KEY_COUNT=$(echo "$SSH_AUTH_KEYS" | grep -c '^[a-z]' || echo "0")
+  # Robustly count SSH keys with integer validation
+  KEY_COUNT=$(echo "$SSH_AUTH_KEYS" | grep -c '^[a-z]' 2>/dev/null || echo "0")
+  KEY_COUNT="${KEY_COUNT//[^0-9]/}"
+  KEY_COUNT="${KEY_COUNT:-0}"
   echo "  Added $KEY_COUNT SSH public key(s) for user '$USERNAME'"
-  if [ -n "${SSH_AUTH_USERNAME:-}" ]; then
-    echo "  User added to Administrators group (create/merge permissions)"
-  fi
 done
 
 echo ""

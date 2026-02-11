@@ -22,7 +22,7 @@ inputs:
             - Empty string or omitted: Replicate ALL projects from server
             - Literal name: "releng/lftools" - single project
             - Comma-separated: "releng/lftools,ci-management" - multiple projects
-            - Regex pattern: "releng/.*" or "^infra/.*" - pattern matching
+            - Regex pattern: "regex:releng/.*" or "regex:^infra/.*" - pattern matching
         - api_path (optional): API path prefix (e.g., "/infra", "/r", "/gerrit")
 
       Can be overridden by repository variable GERRIT_SETUP

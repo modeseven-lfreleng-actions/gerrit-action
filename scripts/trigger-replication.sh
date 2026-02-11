@@ -242,9 +242,18 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
 
   # Check if any repositories were created/populated (excludes All-Projects and All-Users)
   # Note: expected_count from remote API also excludes system repos, so counts are aligned
+  # Use -prune to avoid descending into .git directories and double-counting
+  # Also verify each directory is a bare repo by checking for HEAD file
   REPO_COUNT=$(docker exec "$cid" sh -c \
-    "find /var/gerrit/git -name '*.git' -type d 2>/dev/null | grep -v -E 'All-Projects|All-Users' | wc -l" \
+    "find /var/gerrit/git -name '*.git' -type d -prune 2>/dev/null | while read -r dir; do
+      if [ -f \"\$dir/HEAD\" ]; then
+        echo \"\$dir\"
+      fi
+    done | grep -v -E 'All-Projects|All-Users' | wc -l" 2>/dev/null \
     || echo "0")
+  # Ensure REPO_COUNT is a valid integer (strip non-digits, default to 0)
+  REPO_COUNT="${REPO_COUNT//[^0-9]/}"
+  REPO_COUNT="${REPO_COUNT:-0}"
 
   echo "Replicated repositories: $REPO_COUNT"
 
@@ -254,11 +263,11 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   if [ "${DEBUG:-false}" = "true" ]; then
     echo "  (DEBUG=true: showing full repository list)"
     docker exec "$cid" sh -c \
-      "find /var/gerrit/git -name '*.git' -type d 2>/dev/null" || true
+      "find /var/gerrit/git -name '*.git' -type d -prune 2>/dev/null" || true
   else
     echo "  (showing first 50 repositories; set DEBUG=true for full list)"
     docker exec "$cid" sh -c \
-      "find /var/gerrit/git -name '*.git' -type d 2>/dev/null | head -50" || true
+      "find /var/gerrit/git -name '*.git' -type d -prune 2>/dev/null | head -50" || true
   fi
   echo ""
 

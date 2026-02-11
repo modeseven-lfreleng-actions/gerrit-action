@@ -437,7 +437,12 @@ for i in {1..24}; do
   elapsed=$((i * 5))
 
   # Count repos (excluding All-Projects, All-Users)
-  repo_count=$(find "$INSTANCE_DIR/git" -name "*.git" -type d 2>/dev/null | grep -c -v -E "All-Projects|All-Users" || echo "0")
+  # Use -prune to avoid descending into .git directories and double-counting
+  # Robust integer validation to handle edge cases
+  repo_count=$(find "$INSTANCE_DIR/git" -name "*.git" -type d -prune 2>/dev/null | grep -c -v -E "All-Projects|All-Users" 2>/dev/null || echo "0")
+  # Ensure repo_count is a valid integer (strip non-digits, default to 0)
+  repo_count="${repo_count//[^0-9]/}"
+  repo_count="${repo_count:-0}"
   disk_usage=$(du -sh "$INSTANCE_DIR/git" 2>/dev/null | cut -f1)
 
   echo "[${elapsed}s] Repos: $repo_count, Disk: $disk_usage"
@@ -472,7 +477,7 @@ log_info "Final State"
 log_info "=============================================="
 
 log_info "Git directory contents:"
-find "$INSTANCE_DIR/git" -name "*.git" -type d 2>/dev/null | head -20 || echo "(none)"
+find "$INSTANCE_DIR/git" -name "*.git" -type d -prune 2>/dev/null | head -20 || echo "(none)"
 
 echo ""
 log_info "Disk usage:"
