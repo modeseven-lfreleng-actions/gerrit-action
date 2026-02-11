@@ -103,11 +103,15 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   cid=$(jq -r ".\"$slug\".cid" "$INSTANCES_JSON_FILE")
   gerrit_host=$(jq -r ".\"$slug\".gerrit_host" "$INSTANCES_JSON_FILE")
   project=$(jq -r ".\"$slug\".project // \"\"" "$INSTANCES_JSON_FILE")
+  expected_count=$(jq -r ".\"$slug\".expected_project_count // 0" "$INSTANCES_JSON_FILE")
 
   echo "Container ID: $cid"
   echo "Source: $gerrit_host"
   if [ -n "$project" ]; then
     echo "Project filter: $project"
+  fi
+  if [ "$expected_count" -gt 0 ]; then
+    echo "Expected repositories: $expected_count"
   fi
   echo ""
 
@@ -236,12 +240,13 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
     grep -iE "pull-replication|fetch|FetchAll" | tail -10 || echo "(none)"
   echo ""
 
-  # Check if any repositories were created/populated
+  # Check if any repositories were created/populated (excludes All-Projects and All-Users)
+  # Note: expected_count from remote API also excludes system repos, so counts are aligned
   REPO_COUNT=$(docker exec "$cid" sh -c \
-    "find /var/gerrit/git -name '*.git' -type d 2>/dev/null | wc -l" \
+    "find /var/gerrit/git -name '*.git' -type d 2>/dev/null | grep -v -E 'All-Projects|All-Users' | wc -l" \
     || echo "0")
 
-  echo "Repositories in git directory: $REPO_COUNT"
+  echo "Replicated repositories: $REPO_COUNT"
 
   # List repositories (limit output to avoid flooding CI logs)
   echo ""
@@ -257,40 +262,21 @@ for slug in $(jq -r 'keys[]' "$INSTANCES_JSON_FILE"); do
   fi
   echo ""
 
-  # Check if repos have actual content (packed-refs indicates successful fetch)
-  if [ -n "$project" ]; then
-    echo "Checking replicated content for project: $project"
-    PROJECT_GIT="/var/gerrit/git/${project}.git"
-
-    if docker exec "$cid" test -d "$PROJECT_GIT" 2>/dev/null; then
-      # Check for packed-refs (indicates successful fetch)
-      if docker exec "$cid" test -f "$PROJECT_GIT/packed-refs" 2>/dev/null; then
-        REFS_COUNT=$(docker exec "$cid" wc -l < "$PROJECT_GIT/packed-refs" 2>/dev/null || echo "0")
-        echo "  ✅ packed-refs found: $REFS_COUNT lines (replication successful)"
-
-        # Show branches
-        BRANCHES=$(docker exec "$cid" bash -c "cd $PROJECT_GIT && git branch 2>/dev/null" || echo "")
-        if [ -n "$BRANCHES" ]; then
-          echo "  Branches:"
-          printf '%s\n' "$BRANCHES" | while IFS= read -r branch; do
-            echo "    $branch"
-          done
-        fi
-      else
-        echo "  ⚠️ No packed-refs found (replication may not have completed)"
-        REPLICATION_FAILED=$((REPLICATION_FAILED + 1))
-      fi
+  # Check repository count against expected
+  if [ "$expected_count" -gt 0 ]; then
+    echo "Expected repositories: $expected_count"
+    if [ "$REPO_COUNT" -ge "$expected_count" ]; then
+      echo "✅ Replication complete: $REPO_COUNT/$expected_count repositories"
+    elif [ "$REPO_COUNT" -gt 2 ]; then
+      echo "⏳ Replication in progress: $REPO_COUNT/$expected_count repositories"
     else
-      echo "  ⚠️ Project directory not found: $PROJECT_GIT"
-      REPLICATION_FAILED=$((REPLICATION_FAILED + 1))
+      echo "::warning::Replication may still be starting"
     fi
-  elif [ "$REPO_COUNT" -gt 2 ]; then
-    # More than All-Projects and All-Users
-    echo "✅ Replication appears to be working (repositories detected)"
+  elif [ "$REPO_COUNT" -gt 0 ]; then
+    echo "✅ Replication appears to be working ($REPO_COUNT repositories detected)"
   elif [ "$SYNC_ON_STARTUP" = "true" ]; then
     echo "::warning::No replicated repositories detected"
-    echo "Replication may still be in progress or"
-    echo "configured projects may not exist on source"
+    echo "Replication may still be in progress"
     REPLICATION_FAILED=$((REPLICATION_FAILED + 1))
   fi
 

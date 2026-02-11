@@ -117,7 +117,7 @@ Use this action in CI/CD pipelines that need to:
 | sync_on_startup             | False    | `true`  | Trigger replication after startup                                          |
 | fetch_every                 | False    | `60s`   | Interval for pull-replication polling (e.g., `60s`, `5m`, `0s` to disable) |
 | replication_timeout         | False    | `600`   | Timeout for initial replication sync (seconds)                             |
-| replication_wait_timeout    | False    | `300`   | Max time to wait for replication before verification (seconds)             |
+| replication_wait_timeout    | False    | `900`   | Max time to wait for replication to match expected repo count (seconds)    |
 | require_replication_success | False    | `true`  | Fail workflow if replication verification fails                            |
 | sync_refs                   | False    | (all)   | Comma-separated refs to sync (e.g., `+refs/heads/*:refs/heads/*`)          |
 | replication_threads         | False    | `4`     | Number of replication threads per instance                                 |

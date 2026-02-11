@@ -460,20 +460,18 @@ configure_gerrit() {
   echo "  Replication: fetchEvery polling"
 }
 
-# Create empty project directories for replication
-# CRITICAL: The pull-replication plugin's FetchAll iterates over projectCache.all()
-# which only includes projects that exist locally. Without creating these repos
-# first, replicateOnStartup will have nothing to replicate!
-create_project_directories() {
+# Fetch project list from remote Gerrit and pre-create directories for replication
+# This is REQUIRED because fetchEvery mode only polls repos that exist in projectCache.
+# Without pre-creating these directories, the plugin won't know about them and won't fetch.
+fetch_expected_project_count() {
   local instance_dir="$1"
   local project="$2"
   local gerrit_host="$3"
   local slug="$4"
 
-  echo "Creating project directories for replication..."
-  echo "(Required: FetchAll iterates over projectCache.all())"
+  echo "Fetching expected project count from remote..."
 
-  local projects_to_create=()
+  local projects_found=()
 
   # Configurable limit for project fetching (default: 500)
   # Set MAX_PROJECTS environment variable to override
@@ -481,7 +479,7 @@ create_project_directories() {
 
   if [ -z "$project" ]; then
     # No specific project filter - fetch ALL projects from remote server
-    echo "No project filter specified, fetching project list from remote..."
+    echo "  No project filter, fetching full project list..."
     echo "  (Max projects: $max_projects - set MAX_PROJECTS env to override)"
 
     # Get API path for this instance
@@ -493,11 +491,11 @@ create_project_directories() {
     if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "" "$max_projects"); then
       # Convert newline-separated list to array
       while IFS= read -r proj; do
-        [ -n "$proj" ] && projects_to_create+=("$proj")
+        [ -n "$proj" ] && projects_found+=("$proj")
       done <<< "$remote_projects"
     else
       echo "  Warning: Could not fetch remote project list"
-      echo "  Replication will only work for manually created repos"
+      echo "0" > "$instance_dir/expected_project_count"
       return 0
     fi
   else
@@ -514,10 +512,11 @@ create_project_directories() {
       local remote_projects
       if remote_projects=$(fetch_remote_projects "$gerrit_host" "$api_path" "$project" "$max_projects"); then
         while IFS= read -r proj; do
-          [ -n "$proj" ] && projects_to_create+=("$proj")
+          [ -n "$proj" ] && projects_found+=("$proj")
         done <<< "$remote_projects"
       else
         echo "  Warning: Could not fetch filtered project list"
+        echo "0" > "$instance_dir/expected_project_count"
         return 0
       fi
     else
@@ -525,27 +524,43 @@ create_project_directories() {
       IFS=',' read -ra PROJECTS <<< "$project"
       for proj in "${PROJECTS[@]}"; do
         proj=$(echo "$proj" | xargs)  # trim whitespace
-        [ -n "$proj" ] && projects_to_create+=("$proj")
+        [ -n "$proj" ] && projects_found+=("$proj")
       done
     fi
   fi
 
-  # Create directories for all projects
-  local created_count=0
-  for proj in "${projects_to_create[@]}"; do
-    local project_dir="$instance_dir/git/${proj}.git"
-    echo "  Creating: ${proj}.git"
-    mkdir -p "$project_dir"
-    git init --bare "$project_dir" 2>/dev/null || true
-    chmod -R 777 "$project_dir"
-    ((++created_count))
+  # Filter out Gerrit internal projects that are not counted during verification
+  # (All-Projects and All-Users are local system repos, not replicated from remote)
+  local filtered_projects=()
+  for proj in "${projects_found[@]}"; do
+    if [[ "$proj" == "All-Projects" || "$proj" == "All-Users" ]]; then
+      continue
+    fi
+    filtered_projects+=("$proj")
   done
 
-  echo "Project directories created: $created_count ✅"
-
   # Store expected project count for later verification
-  # This file will be read when building instances.json
-  echo "$created_count" > "$instance_dir/expected_project_count"
+  local expected_count=${#filtered_projects[@]}
+  echo "  Found $expected_count projects on remote server (excluding All-Projects/All-Users)"
+  echo "$expected_count" > "$instance_dir/expected_project_count"
+
+  # Pre-create empty bare repositories for each project
+  # This is REQUIRED because fetchEvery mode only polls repos that exist in projectCache.
+  # Without pre-creating these directories, the plugin won't know about them and won't fetch.
+  # The createMissingRepositories setting only helps when a fetch is attempted, but
+  # fetchEvery won't attempt to fetch repos it doesn't know about.
+  echo "  Pre-creating project directories for replication..."
+  local created_count=0
+  for proj in "${filtered_projects[@]}"; do
+    local project_dir="$instance_dir/git/${proj}.git"
+    if [ ! -d "$project_dir" ]; then
+      mkdir -p "$project_dir"
+      git init --bare "$project_dir" >/dev/null 2>&1
+      chmod -R 777 "$project_dir"
+      created_count=$((created_count + 1))
+    fi
+  done
+  echo "  Created $created_count project directories"
 }
 
 # Start single instance
@@ -714,9 +729,9 @@ start_instance() {
     "$slug" "$gerrit_host" "$project"
   generate_secure_config "$instance_dir/etc/secure.config" "$slug"
 
-  # Create project directories for replication
-  # Pass gerrit_host and slug so we can fetch remote project list if needed
-  create_project_directories "$instance_dir" "$project" "$gerrit_host" "$slug"
+  # Fetch project list from remote and pre-create directories for replication
+  # Pre-creation is REQUIRED because fetchEvery mode only polls repos in projectCache
+  fetch_expected_project_count "$instance_dir" "$project" "$gerrit_host" "$slug"
 
   # Remove the bundled replication plugin to avoid conflicts
   # The pull-replication plugin will be used instead

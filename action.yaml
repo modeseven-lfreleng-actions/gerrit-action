@@ -117,11 +117,13 @@ inputs:
     default: 'true'
   replication_wait_timeout:
     description: |
-      Maximum time (in seconds) to wait for replication to complete
-      before checking for replicated repositories. Only used when
-      sync_on_startup is true.
+      Maximum time (in seconds) to wait for replication to complete.
+      Replication is considered complete when the repository count
+      matches the expected count from the remote Gerrit server.
+      Increase this value for large Gerrit instances.
+      Only used when sync_on_startup is true.
     required: false
-    default: '300'
+    default: '600'
 
   # Optional - Container Management
   exit:
