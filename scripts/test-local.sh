@@ -9,6 +9,7 @@
 # - Configuring fetchEvery polling mode (web UI enabled)
 # - Pre-creating project directories for replication
 # - Verifying replication works correctly
+# - Testing SSH key authentication (optional)
 #
 # Usage: ./test-local.sh [gerrit_host] [project]
 #
@@ -25,6 +26,10 @@
 #   HTTP_PORT            - Local HTTP port (default: 8080)
 #   FETCH_EVERY          - Polling interval (default: 15s)
 #   USE_CUSTOM_IMAGE     - Build/use custom image with uv (default: true)
+#   TEST_SSH_AUTH        - Test SSH authentication setup (default: false)
+#   SSH_AUTH_USERNAME    - Username for SSH auth test (default: testuser)
+#   SSH_AUTH_KEYS        - SSH public keys to add (default: generates test key)
+#   DEBUG                - Enable debug output (default: false)
 #
 # Prerequisites:
 #   - Docker running
@@ -32,8 +37,39 @@
 
 set -euo pipefail
 
-# Script directory for finding Dockerfile
+# Script directory for finding Dockerfile and shared libraries
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Check for Python setup script
+PYTHON_SETUP_SCRIPT="$SCRIPT_DIR/setup-gerrit-user.py"
+if [ -f "$PYTHON_SETUP_SCRIPT" ]; then
+  HAVE_PYTHON_SETUP=true
+else
+  echo "[WARN] Python setup script not found: $PYTHON_SETUP_SCRIPT"
+  echo "[WARN] SSH auth testing will not be available"
+  HAVE_PYTHON_SETUP=false
+fi
+
+# Determine Python command
+get_python_cmd() {
+  if command -v python3 &>/dev/null; then
+    if python3 -c "import requests" 2>/dev/null; then
+      echo "python3"
+      return 0
+    elif command -v uv &>/dev/null; then
+      echo "uv run --with requests python3"
+      return 0
+    fi
+  fi
+  if command -v python &>/dev/null; then
+    if python -c "import requests" 2>/dev/null; then
+      echo "python"
+      return 0
+    fi
+  fi
+  echo ""
+  return 1
+}
 
 # Configuration
 GERRIT_HOST="${1:-gerrit.linuxfoundation.org}"
@@ -41,11 +77,16 @@ PROJECT="${2:-releng/lftools}"
 API_PATH="${API_PATH:-/infra}"
 GERRIT_VERSION="${GERRIT_VERSION:-3.13.1-ubuntu24}"
 PLUGIN_VERSION="${PLUGIN_VERSION:-stable-3.13}"
-CONTAINER_NAME="gerrit-local-test"
+# Use unique container name and directory to avoid conflicts with stale runs
+RUN_ID="$$-$(date +%s)"
+CONTAINER_NAME="gerrit-local-test-${RUN_ID}"
 HTTP_PORT="${HTTP_PORT:-8080}"
 FETCH_EVERY="${FETCH_EVERY:-15s}"
-INSTANCE_DIR="/tmp/gerrit-local-test"
+INSTANCE_DIR="/tmp/gerrit-local-test-${RUN_ID}"
 USE_CUSTOM_IMAGE="${USE_CUSTOM_IMAGE:-true}"
+TEST_SSH_AUTH="${TEST_SSH_AUTH:-false}"
+SSH_AUTH_USERNAME="${SSH_AUTH_USERNAME:-testuser}"
+DEBUG="${DEBUG:-false}"
 
 # Custom image settings
 CUSTOM_IMAGE_NAME="gerrit-extended"
@@ -148,9 +189,22 @@ cleanup() {
   log_info "Cleaning up..."
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
   # Use Docker to remove files that may have been created with root ownership
+  # This is necessary because Gerrit container runs as UID 1000 which may differ from host user
   if [ -d "$INSTANCE_DIR" ]; then
-    docker run --rm -v "$INSTANCE_DIR:/cleanup" alpine rm -rf /cleanup/* 2>/dev/null || true
-    rm -rf "$INSTANCE_DIR" 2>/dev/null || true
+    log_info "Removing instance directory: $INSTANCE_DIR"
+    # Use alpine container to clean up with root privileges inside container
+    docker run --rm -v "$INSTANCE_DIR:/cleanup:rw" alpine sh -c "rm -rf /cleanup/* /cleanup/.[!.]*" 2>/dev/null || true
+    rmdir "$INSTANCE_DIR" 2>/dev/null || true
+  fi
+  # Also clean up any stale test directories older than 1 hour
+  find /tmp -maxdepth 1 -name "gerrit-local-test-*" -type d -mmin +60 2>/dev/null | while read -r old_dir; do
+    log_info "Cleaning stale directory: $old_dir"
+    docker run --rm -v "$old_dir:/cleanup:rw" alpine sh -c "rm -rf /cleanup/* /cleanup/.[!.]*" 2>/dev/null || true
+    rmdir "$old_dir" 2>/dev/null || true
+  done
+  # Clean up test SSH keys if generated
+  if [ -n "${TEST_KEY_DIR:-}" ] && [ -d "${TEST_KEY_DIR:-}" ]; then
+    rm -rf "$TEST_KEY_DIR" 2>/dev/null || true
   fi
 }
 
@@ -161,25 +215,23 @@ trap cleanup EXIT
 log_info "=============================================="
 log_info "Local Gerrit Test - fetchEvery Mode"
 log_info "=============================================="
+log_info "Run ID: $RUN_ID"
 log_info "Host: $GERRIT_HOST"
 log_info "Project: $PROJECT"
 log_info "API Path: $API_PATH"
 log_info "Gerrit Version: $GERRIT_VERSION"
 log_info "Fetch interval: $FETCH_EVERY"
 log_info "Custom image: $USE_CUSTOM_IMAGE"
+log_info "Instance dir: $INSTANCE_DIR"
 log_info ""
 log_info "Goal: Test pull-replication with web UI enabled"
 echo ""
 
 load_credentials
 
-# Cleanup any previous run
+# No need to clean up previous run - we use unique directory each time
+# Just ensure no container with same name exists (shouldn't happen with unique names)
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-# Use Docker to remove files that may have been created with root ownership
-if [ -d "$INSTANCE_DIR" ]; then
-  docker run --rm -v "$INSTANCE_DIR:/cleanup" alpine rm -rf /cleanup/* 2>/dev/null || true
-  rm -rf "$INSTANCE_DIR" 2>/dev/null || true
-fi
 
 # Build custom image (if enabled)
 build_custom_image
@@ -190,11 +242,20 @@ echo ""
 # Create directory structure
 log_info "Creating Gerrit site structure..."
 # The official gerritcodereview/gerrit image uses UID:GID 1000:1000
-GERRIT_UID=1000
-GERRIT_GID=1000
-mkdir -p "$INSTANCE_DIR"/{git,cache,index,data,etc,logs,plugins,tmp}
-chown -R "$GERRIT_UID:$GERRIT_GID" "$INSTANCE_DIR"
-chmod -R 755 "$INSTANCE_DIR"
+# On macOS with Docker Desktop, file permissions are handled automatically
+# via the gRPC FUSE file sharing, so we don't need to chown
+# On Linux, Docker handles this via user namespace mapping or the container runs as root
+# NOTE: We do NOT create/mount etc directory - we let the container use its own
+# config which includes the OOTB filter for automatic account creation.
+# We'll copy our config files (replication, secure) into the container after start.
+mkdir -p "$INSTANCE_DIR"/{git,cache,index,data,logs,plugins,tmp,config-staging}
+# Only attempt chown on Linux where it might be needed and we might have permission
+if [ "$(uname -s)" = "Linux" ]; then
+  GERRIT_UID=1000
+  GERRIT_GID=1000
+  chown -R "$GERRIT_UID:$GERRIT_GID" "$INSTANCE_DIR" 2>/dev/null || true
+fi
+chmod -R 755 "$INSTANCE_DIR" 2>/dev/null || true
 
 # Build git URL - use authenticated HTTPS with /a/ prefix
 # The /a/ prefix is Gerrit's authenticated endpoint
@@ -202,8 +263,9 @@ chmod -R 755 "$INSTANCE_DIR"
 GIT_URL="https://${GERRIT_HOST}${API_PATH}/a/\${name}.git"
 
 # Create replication.config with fetchEvery (matching CI config)
+# This will be copied into the container after start
 log_info "Creating replication.config (fetchEvery mode)..."
-cat > "$INSTANCE_DIR/etc/replication.config" <<EOF
+cat > "$INSTANCE_DIR/config-staging/replication.config" <<EOF
 # Pull-replication configuration - fetchEvery mode
 # Matching CI configuration from start-instances.sh
 #
@@ -239,98 +301,23 @@ EOF
 
 log_success "replication.config created"
 echo ""
-cat "$INSTANCE_DIR/etc/replication.config"
+cat "$INSTANCE_DIR/config-staging/replication.config"
 echo ""
 
-# Create secure.config
+# Create secure.config (will be copied into container after start)
 log_info "Creating secure.config..."
-cat > "$INSTANCE_DIR/etc/secure.config" <<EOF
+cat > "$INSTANCE_DIR/config-staging/secure.config" <<EOF
 [remote "source"]
   username = ${GERRIT_HTTP_USERNAME}
   password = ${GERRIT_HTTP_PASSWORD}
 EOF
-# Set ownership to Gerrit UID/GID (1000:1000) so container can read it
-# This is necessary because bind mounts preserve host UID/GID
-chown "$GERRIT_UID:$GERRIT_GID" "$INSTANCE_DIR/etc/secure.config"
-chmod 600 "$INSTANCE_DIR/etc/secure.config"
+chmod 600 "$INSTANCE_DIR/config-staging/secure.config" 2>/dev/null || true
 log_success "secure.config created"
 
-# Initialize Gerrit site first (required before starting)
-log_info "Initializing Gerrit site..."
-log_info "Using image: ${DOCKER_IMAGE}"
-docker run --rm \
-  -v "$INSTANCE_DIR/git:/var/gerrit/git" \
-  -v "$INSTANCE_DIR/cache:/var/gerrit/cache" \
-  -v "$INSTANCE_DIR/index:/var/gerrit/index" \
-  -v "$INSTANCE_DIR/data:/var/gerrit/data" \
-  -v "$INSTANCE_DIR/etc:/var/gerrit/etc" \
-  -v "$INSTANCE_DIR/logs:/var/gerrit/logs" \
-  -v "$INSTANCE_DIR/plugins:/var/gerrit/plugins" \
-  -e CANONICAL_WEB_URL="http://localhost:$HTTP_PORT" \
-  "${DOCKER_IMAGE}" \
-  init
-
-log_success "Gerrit site initialized"
-
-# Show what plugins were installed by init
-log_info "Bundled plugins after init:"
-ls -la "$INSTANCE_DIR/plugins/"
-
-# Remove bundled replication plugin (conflicts with pull-replication)
-# Keep replication-api.jar as pull-replication depends on it
-log_info "Removing bundled replication plugin (keeping replication-api)..."
-rm -f "$INSTANCE_DIR/plugins/replication.jar"
-log_success "Bundled replication plugin removed"
-
-# Download pull-replication plugin AFTER init
-log_info "Downloading pull-replication plugin..."
-PLUGIN_URL="https://gerrit-ci.gerritforge.com/job/plugin-pull-replication-gh-bazel-${PLUGIN_VERSION}/lastSuccessfulBuild/artifact/bazel-bin/plugins/pull-replication/pull-replication.jar"
-
-# Download with proper error handling
-if curl -fL --retry 3 -o "$INSTANCE_DIR/plugins/pull-replication.jar" "$PLUGIN_URL"; then
-  # Verify it's a valid JAR (should start with PK for zip format)
-  if file "$INSTANCE_DIR/plugins/pull-replication.jar" | grep -q "Zip archive\|Java archive"; then
-    log_success "Plugin downloaded and verified"
-  else
-    log_error "Downloaded file is not a valid JAR"
-    log_error "File type: $(file "$INSTANCE_DIR/plugins/pull-replication.jar")"
-    log_error "First bytes: $(head -c 50 "$INSTANCE_DIR/plugins/pull-replication.jar" | xxd | head -2)"
-    exit 1
-  fi
-else
-  log_error "Failed to download plugin from: $PLUGIN_URL"
-  exit 1
-fi
-
-# Apply custom Gerrit configuration (overwrites init defaults)
-log_info "Applying custom configuration..."
-cat > "$INSTANCE_DIR/etc/gerrit.config" <<EOF
-[gerrit]
-  basePath = git
-  canonicalWebUrl = http://localhost:${HTTP_PORT}/
-
-[index]
-  type = LUCENE
-
-[auth]
-  type = DEVELOPMENT_BECOME_ANY_ACCOUNT
-
-[sshd]
-  listenAddress = off
-
-[httpd]
-  listenUrl = http://*:${HTTP_PORT}/
-
-[cache]
-  directory = cache
-
-[container]
-  javaOptions = -Xmx512m
-  user = gerrit
-  # NOTE: replica is NOT set - web UI is enabled
-EOF
-
-log_success "gerrit.config updated"
+# NOTE: We skip the separate init step - the container will init on first start.
+# This ensures the container's built-in OOTB filter config is preserved,
+# which is required for DEVELOPMENT_BECOME_ANY_ACCOUNT mode to work properly.
+log_info "Skipping separate init - container will self-initialize with proper OOTB config"
 
 # Pre-create the project directory so fetchEvery knows about it
 # This is required because fetchEvery only polls repos in projectCache
@@ -338,24 +325,29 @@ log_info "Pre-creating project directory: ${PROJECT}.git"
 PROJECT_DIR="$INSTANCE_DIR/git/${PROJECT}.git"
 mkdir -p "$PROJECT_DIR"
 git init --bare "$PROJECT_DIR" 2>/dev/null
-# Set proper ownership for Gerrit user (UID:GID 1000:1000)
-chown -R 1000:1000 "$PROJECT_DIR"
-chmod -R 755 "$PROJECT_DIR"
+# Set proper permissions - ownership handled by Docker on macOS
+if [ "$(uname -s)" = "Linux" ]; then
+  chown -R 1000:1000 "$PROJECT_DIR" 2>/dev/null || true
+fi
+chmod -R 755 "$PROJECT_DIR" 2>/dev/null || true
 log_success "Project directory created"
 
 # Start Gerrit container
+# IMPORTANT: We do NOT mount /var/gerrit/etc - this preserves the container's
+# built-in OOTB filter configuration which is required for DEVELOPMENT_BECOME_ANY_ACCOUNT
+# to work properly. We'll copy our config files into the container after start.
 log_info "Starting Gerrit container..."
 docker run -d \
   --name "$CONTAINER_NAME" \
-  -p "${HTTP_PORT}:${HTTP_PORT}" \
+  -p "${HTTP_PORT}:8080" \
   -v "$INSTANCE_DIR/git:/var/gerrit/git" \
-  -v "$INSTANCE_DIR/etc:/var/gerrit/etc" \
   -v "$INSTANCE_DIR/cache:/var/gerrit/cache" \
   -v "$INSTANCE_DIR/index:/var/gerrit/index" \
   -v "$INSTANCE_DIR/logs:/var/gerrit/logs" \
   -v "$INSTANCE_DIR/plugins:/var/gerrit/plugins" \
   -v "$INSTANCE_DIR/data:/var/gerrit/data" \
-  -v "$INSTANCE_DIR/tmp:/var/gerrit/tmp" \
+  -e "CANONICAL_WEB_URL=http://localhost:${HTTP_PORT}/" \
+  -e "AUTH_TYPE=DEVELOPMENT_BECOME_ANY_ACCOUNT" \
   "${DOCKER_IMAGE}"
 
 log_success "Container started"
@@ -363,6 +355,53 @@ echo ""
 
 # Wait for Gerrit to start
 log_info "Waiting for Gerrit to start..."
+for i in {1..60}; do
+  if curl -s "http://localhost:${HTTP_PORT}/" >/dev/null 2>&1; then
+    log_success "Gerrit is responding!"
+    break
+  fi
+  echo -n "."
+  sleep 2
+done
+echo ""
+
+# Copy our config files into the running container
+log_info "Copying replication configuration into container..."
+docker cp "$INSTANCE_DIR/config-staging/replication.config" "$CONTAINER_NAME:/var/gerrit/etc/replication.config"
+docker cp "$INSTANCE_DIR/config-staging/secure.config" "$CONTAINER_NAME:/var/gerrit/etc/secure.config"
+# Set proper ownership inside container
+docker exec "$CONTAINER_NAME" chown gerrit:gerrit /var/gerrit/etc/replication.config /var/gerrit/etc/secure.config 2>/dev/null || true
+log_success "Replication config copied"
+
+# Download pull-replication plugin directly into the container
+log_info "Downloading pull-replication plugin..."
+PLUGIN_URL="https://gerrit-ci.gerritforge.com/job/plugin-pull-replication-gh-bazel-${PLUGIN_VERSION}/lastSuccessfulBuild/artifact/bazel-bin/plugins/pull-replication/pull-replication.jar"
+# Download to staging first, then copy into container
+if curl -fL --retry 3 -o "$INSTANCE_DIR/config-staging/pull-replication.jar" "$PLUGIN_URL"; then
+  # Verify it's a valid JAR
+  if file "$INSTANCE_DIR/config-staging/pull-replication.jar" | grep -q "Zip archive\|Java archive"; then
+    log_success "Plugin downloaded and verified"
+    # Remove bundled replication plugin and copy pull-replication
+    docker exec "$CONTAINER_NAME" rm -f /var/gerrit/plugins/replication.jar 2>/dev/null || true
+    docker cp "$INSTANCE_DIR/config-staging/pull-replication.jar" "$CONTAINER_NAME:/var/gerrit/plugins/pull-replication.jar"
+    docker exec "$CONTAINER_NAME" chown gerrit:gerrit /var/gerrit/plugins/pull-replication.jar 2>/dev/null || true
+    log_success "Pull-replication plugin installed"
+  else
+    log_error "Downloaded file is not a valid JAR"
+    exit 1
+  fi
+else
+  log_error "Failed to download plugin from: $PLUGIN_URL"
+  exit 1
+fi
+
+# Restart Gerrit to pick up new plugins and config
+log_info "Restarting Gerrit to load new plugins..."
+docker restart "$CONTAINER_NAME"
+
+# Wait for Gerrit to come back up
+log_info "Waiting for Gerrit to restart..."
+sleep 5
 for i in {1..60}; do
   if curl -s "http://localhost:${HTTP_PORT}/" >/dev/null 2>&1; then
     log_success "Gerrit is responding!"
@@ -384,7 +423,7 @@ fi
 
 # Check plugin loaded
 log_info "Checking pull-replication plugin..."
-sleep 5
+sleep 3
 
 PLUGIN_WORKING=false
 
@@ -414,6 +453,12 @@ if [ "$PLUGIN_WORKING" = "false" ]; then
     log_warn "Plugin may not be fully loaded, continuing anyway..."
     docker logs "$CONTAINER_NAME" 2>&1 | tail -30
   fi
+fi
+
+# Verify DEVELOPMENT_BECOME_ANY_ACCOUNT mode is working
+if [ "${DEBUG:-false}" = "true" ]; then
+  log_info "Verifying DEVELOPMENT_BECOME_ANY_ACCOUNT mode..."
+  docker exec "$CONTAINER_NAME" cat /var/gerrit/etc/gerrit.config | grep -A2 '\[auth\]'
 fi
 echo ""
 
@@ -495,6 +540,59 @@ echo ""
 log_info "Container logs (replication related, last 50 lines):"
 docker logs "$CONTAINER_NAME" 2>&1 | grep -iE "replication|pull-replication|fetch|remote|FetchAll|apiUrl" | tail -50 || echo "(no matches)"
 
+# Test SSH authentication if enabled
+SSH_AUTH_SUCCESS=false
+if [ "$TEST_SSH_AUTH" = "true" ]; then
+  echo ""
+  log_info "=============================================="
+  log_info "Testing SSH Authentication Setup"
+  log_info "=============================================="
+
+  if [ "$HAVE_PYTHON_SETUP" = "true" ]; then
+    PYTHON_CMD=$(get_python_cmd)
+    if [ -z "$PYTHON_CMD" ]; then
+      log_warn "Python with 'requests' module not available"
+      log_warn "Install: pip install requests, or install uv"
+    else
+      # Generate a test SSH key if not provided
+      if [ -z "${SSH_AUTH_KEYS:-}" ]; then
+        log_info "Generating test SSH key..."
+        TEST_KEY_DIR="/tmp/gerrit-test-ssh-$$"
+        mkdir -p "$TEST_KEY_DIR"
+        ssh-keygen -t ed25519 -f "$TEST_KEY_DIR/id_test" -N "" -C "gerrit-test@example.com" >/dev/null 2>&1
+        SSH_AUTH_KEYS=$(cat "$TEST_KEY_DIR/id_test.pub")
+        log_success "Test SSH key generated"
+        echo "  Private key: $TEST_KEY_DIR/id_test"
+        echo "  Public key: $TEST_KEY_DIR/id_test.pub"
+      fi
+
+      log_info "Setting up user '$SSH_AUTH_USERNAME' with SSH key..."
+      log_info "Using Python Gerrit API client"
+
+      # Build Python command arguments
+      PYTHON_ARGS=("$PYTHON_SETUP_SCRIPT")
+      PYTHON_ARGS+=("--url" "http://localhost:${HTTP_PORT}")
+      PYTHON_ARGS+=("--username" "$SSH_AUTH_USERNAME")
+      PYTHON_ARGS+=("--ssh-key" "$SSH_AUTH_KEYS")
+      if [ "$DEBUG" = "true" ]; then
+        PYTHON_ARGS+=("--debug")
+      else
+        PYTHON_ARGS+=("-v")
+      fi
+
+      # Run the Python setup script
+      if $PYTHON_CMD "${PYTHON_ARGS[@]}"; then
+        SSH_AUTH_SUCCESS=true
+        log_success "SSH authentication configured!"
+      else
+        log_error "Failed to configure SSH authentication"
+      fi
+    fi
+  else
+    log_warn "Python setup script not available - skipping SSH auth test"
+  fi
+fi
+
 echo ""
 log_info "=============================================="
 if [ "$SUCCESS" = true ]; then
@@ -504,6 +602,9 @@ if [ "$SUCCESS" = true ]; then
   log_success "- Repository sync completed"
   if [ "$USE_CUSTOM_IMAGE" = "true" ]; then
     log_success "- Custom image with uv/gerrit_to_platform verified"
+  fi
+  if [ "$TEST_SSH_AUTH" = "true" ] && [ "$SSH_AUTH_SUCCESS" = "true" ]; then
+    log_success "- SSH authentication configured for '$SSH_AUTH_USERNAME'"
   fi
 else
   # Check if repo was created but empty
@@ -531,6 +632,11 @@ if [ "$USE_CUSTOM_IMAGE" = "true" ]; then
   log_info "To test uv/gerrit_to_platform in the container:"
   log_info "  docker exec -it $CONTAINER_NAME uv --version"
   log_info "  docker exec -it $CONTAINER_NAME uv tool list"
+fi
+if [ "$TEST_SSH_AUTH" = "true" ] && [ -n "${TEST_KEY_DIR:-}" ]; then
+  log_info ""
+  log_info "To test SSH access (if SSHD is enabled):"
+  log_info "  ssh -i $TEST_KEY_DIR/id_test -p 29418 $SSH_AUTH_USERNAME@localhost gerrit version"
 fi
 log_info ""
 log_info "Press Ctrl+C to stop and cleanup"

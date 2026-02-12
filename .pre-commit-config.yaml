@@ -64,6 +64,8 @@ repos:
     rev: a66e98df7b4aeeb3724184b332785976d062b92e  # frozen: v1.19.1
     hooks:
       - id: mypy
+        additional_dependencies:
+          - types-requests>=2.28.0
 
   - repo: https://github.com/btford/write-good
     rev: ab66ce10136dfad5146e69e70f82a3efac8842c1 # frozen: v1.0.8
@@ -100,6 +102,11 @@ repos:
     rev: 63c8f8312b7559622c0d82815639671ae42132ac # frozen: v2.4.1
     hooks:
       - id: codespell
+
+  - repo: https://github.com/DetachHead/basedpyright-prek-mirror
+    rev: 1.38.1
+    hooks:
+      - id: basedpyright
 
   - repo: https://github.com/lfreleng-actions/gha-workflow-linter
     rev: a7caf8f3a1a05688d1cee46615ff94def617e5a3  # frozen: v1.0.2

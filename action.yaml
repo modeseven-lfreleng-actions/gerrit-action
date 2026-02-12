@@ -445,10 +445,8 @@ runs:
         GERRIT_SETUP: ${{ inputs.gerrit_setup }}
         DEBUG: ${{ inputs.debug }}
       run: |
-        # Detect Gerrit API paths via redirect detection
-        set -euo pipefail
-
-        source "${{ github.action_path }}/scripts/detect-api-paths.sh"
+        # Detect Gerrit API paths via redirect detection (Python)
+        python3 "${{ github.action_path }}/scripts/detect-api-paths.py"
 
     # Start Gerrit instances
     - name: 'Start Gerrit instances'
@@ -482,10 +480,8 @@ runs:
         TUNNEL_PORTS: ${{ inputs.tunnel_ports }}
         MAX_PROJECTS: ${{ inputs.max_projects }}
       run: |
-        # Start Gerrit instances
-        set -euo pipefail
-
-        source "${{ github.action_path }}/scripts/start-instances.sh"
+        # Start Gerrit instances (Python)
+        python3 "${{ github.action_path }}/scripts/start-instances.py"
 
     # Check service availability
     - name: "Check Gerrit service availability"
@@ -494,11 +490,10 @@ runs:
       env:
         SKIP_PLUGIN_INSTALL: ${{ inputs.skip_plugin_install }}
         USE_API_PATH: ${{ inputs.use_api_path }}
+        DEBUG: ${{ inputs.debug }}
       run: |
-        # Check Gerrit service availability
-        set -euo pipefail
-
-        source "${{ github.action_path }}/scripts/check-services.sh"
+        # Check Gerrit service availability (Python)
+        python3 "${{ github.action_path }}/scripts/check-services.py"
 
     # Add SSH authentication keys for user access
     - name: "Add SSH authentication keys"
@@ -507,12 +502,13 @@ runs:
       env:
         SSH_AUTH_KEYS: ${{ inputs.ssh_auth_keys }}
         SSH_AUTH_USERNAME: ${{ inputs.ssh_auth_username }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
         DEBUG: ${{ inputs.debug }}
       run: |
-        # Add SSH authentication keys for user access
-        set -euo pipefail
-
-        source "${{ github.action_path }}/scripts/add-ssh-auth-keys.sh"
+        # Add SSH authentication keys for user access (Python)
+        python3 "${{ github.action_path }}/scripts/setup-gerrit-user.py" \
+          --instances-file "$WORK_DIR/instances.json" \
+          --loop-instances
 
     # Trigger initial replication
     - name: "Trigger initial replication"
@@ -525,11 +521,10 @@ runs:
         REQUIRE_REPLICATION_SUCCESS: ${{ inputs.require_replication_success }}
         REPLICATION_WAIT_TIMEOUT: ${{ inputs.replication_wait_timeout }}
         FETCH_EVERY: ${{ inputs.fetch_every }}
+        DEBUG: ${{ inputs.debug }}
       run: |
-        # Trigger initial replication
-        set -euo pipefail
-
-        source "${{ github.action_path }}/scripts/trigger-replication.sh"
+        # Trigger initial replication (Python)
+        python3 "${{ github.action_path }}/scripts/trigger-replication.py"
 
     # Verify replication success
     - name: "Verify replication success"
@@ -540,20 +535,18 @@ runs:
         FETCH_EVERY: ${{ inputs.fetch_every }}
         DEBUG: ${{ inputs.debug }}
       run: |
-        # Verify replication success
-        set -euo pipefail
-
-        source "${{ github.action_path }}/scripts/verify-replication.sh"
+        # Verify replication success (Python)
+        python3 "${{ github.action_path }}/scripts/verify-replication.py"
 
     # Collect outputs
     - name: "Collect outputs"
       id: collect-outputs
       shell: bash
+      env:
+        DEBUG: ${{ inputs.debug }}
       run: |
-        # Collect outputs
-        set -euo pipefail
-
-        source "${{ github.action_path }}/scripts/collect-outputs.sh"
+        # Collect outputs (Python)
+        python3 "${{ github.action_path }}/scripts/collect-outputs.py"
 
     # Terminate containers when finished
     - name: "Terminate containers when finished"
@@ -561,31 +554,33 @@ runs:
       shell: bash
       env:
         ENABLE_CACHE: ${{ inputs.enable_cache }}
+        DEBUG: ${{ inputs.debug }}
       run: |
-        # Terminate containers when finished
-        set -euo pipefail
-
-        source "${{ github.action_path }}/scripts/cleanup.sh"
+        # Terminate containers when finished (Python)
+        python3 "${{ github.action_path }}/scripts/cleanup.py"
 
     # Container persistence message
     - name: "Containers will continue/persist"
       if: inputs.exit != 'true'
       shell: bash
       run: |
-        # Containers will continue/persist
-        echo "**Containers Status** 🐳" >> "$GITHUB_STEP_SUMMARY"
-        echo "Containers have detached and will continue/persist" \
-          >> "$GITHUB_STEP_SUMMARY"
-        echo "" >> "$GITHUB_STEP_SUMMARY"
-        echo "To manually cleanup later, run:" >> "$GITHUB_STEP_SUMMARY"
-        echo '```bash' >> "$GITHUB_STEP_SUMMARY"
-
-        # Read instance metadata
-        if [ -f "$WORK_DIR/instances.json" ]; then
-          for slug in $(jq -r 'keys[]' "$WORK_DIR/instances.json"); do
-            cid=$(jq -r ".\"$slug\".cid" "$WORK_DIR/instances.json")
-            echo "docker kill $cid" >> "$GITHUB_STEP_SUMMARY"
-          done
-        fi
-
-        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        # Containers will continue/persist (Python)
+        python3 -c "
+        import json, os, pathlib
+        summary = os.environ.get('GITHUB_STEP_SUMMARY', '')
+        if not summary:
+            exit(0)
+        lines = ['**Containers Status** 🐳', '',
+                 'Containers have detached and will continue/persist', '',
+                 'To manually cleanup later, run:', '\`\`\`bash']
+        instances_path = pathlib.Path(os.environ.get('WORK_DIR', '')) / 'instances.json'
+        if instances_path.is_file():
+            data = json.loads(instances_path.read_text())
+            for slug in sorted(data):
+                cid = data[slug].get('cid', '')
+                if cid:
+                    lines.append(f'docker kill {cid}')
+        lines.extend(['\`\`\`', ''])
+        with open(summary, 'a') as fh:
+            fh.write('\n'.join(lines) + '\n')
+        "

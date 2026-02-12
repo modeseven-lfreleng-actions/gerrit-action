@@ -70,6 +70,12 @@ RUN mkdir -p /opt/uv-tools/bin && chmod 755 /opt/uv-tools
 # This installs executables: change-merged, comment-added, patchset-created
 RUN /usr/local/bin/uv tool install gerrit-to-platform
 
+# Create a Python virtual environment for the Gerrit API scripts
+# and install required dependencies
+ENV GERRIT_SCRIPTS_VENV=/opt/gerrit-scripts
+RUN python3 -m venv $GERRIT_SCRIPTS_VENV && \
+    $GERRIT_SCRIPTS_VENV/bin/pip install --no-cache-dir requests
+
 # Make tool binaries accessible system-wide
 RUN ln -sf /opt/uv-tools/bin/change-merged /usr/local/bin/change-merged && \
     ln -sf /opt/uv-tools/bin/comment-added /usr/local/bin/comment-added && \
@@ -82,13 +88,14 @@ RUN set -eux; \
     uvx --version && \
     uv tool list && \
     change-merged --help | head -5 || echo "Note: change-merged requires args" && \
+    $GERRIT_SCRIPTS_VENV/bin/python -c "import requests; print('requests:', requests.__version__)" && \
     echo "=== Root verification complete ==="
 
 # Switch back to gerrit user for normal operation
 USER gerrit
 
-# Set PATH to include uv tools for gerrit user
-ENV PATH="/opt/uv-tools/bin:/usr/local/bin:${PATH}"
+# Set PATH to include uv tools and scripts venv for gerrit user
+ENV PATH="/opt/gerrit-scripts/bin:/opt/uv-tools/bin:/usr/local/bin:${PATH}"
 
 # Verify tools are accessible as gerrit user
 RUN set -eux; \
