@@ -119,9 +119,11 @@ check_replication_errors() {
 check_pull_replication_log() {
   local cid="$1"
   local expected_count="${2:-0}"
+  local debug="${DEBUG:-false}"
 
   # Check if the log file exists
   if ! docker exec "$cid" test -f /var/gerrit/logs/pull_replication_log 2>/dev/null; then
+    [ "$debug" = "true" ] && echo "    [DEBUG] pull_replication_log not found" >&2
     return 1  # No log file yet
   fi
 
@@ -131,6 +133,7 @@ check_pull_replication_log() {
   recent_errors=$(docker exec "$cid" tail -n 200 /var/gerrit/logs/pull_replication_log 2>/dev/null | \
     grep -iE "Cannot replicate|TransportException|git-upload-pack not permitted|Permission denied|Connection refused" || echo "")
   if [ -n "$recent_errors" ]; then
+    [ "$debug" = "true" ] && echo "    [DEBUG] Found replication errors in log" >&2
     return 1  # Found errors, replication failed
   fi
 
@@ -144,30 +147,32 @@ check_pull_replication_log() {
   #   - SSH: ssh://gerrit.example.org:29418/<project>.git
   # Use portable sed (not awk with capture groups which requires gawk)
   # Extract project name: everything after /a/ and before .git
+  # Exclude All-Projects and All-Users (system repos) to match count_repositories
   local completed_count
-  completed_count=$(docker exec "$cid" sh -c "grep 'Replication from .* completed' /var/gerrit/logs/pull_replication_log 2>/dev/null | sed 's|.*Replication from .*/a/||; s|\\.git completed.*||' | sort -u | wc -l" 2>/dev/null)
+  completed_count=$(docker exec "$cid" sh -c "grep 'Replication from .* completed' /var/gerrit/logs/pull_replication_log 2>/dev/null | sed 's|.*Replication from .*/a/||; s|\\.git completed.*||' | grep -v -E '^All-Projects\$|^All-Users\$' | sort -u | wc -l" 2>/dev/null)
   # Ensure completed_count is a valid integer (default to 0 if empty or invalid)
   completed_count="${completed_count//[^0-9]/}"
   completed_count="${completed_count:-0}"
+
+  [ "$debug" = "true" ] && echo "    [DEBUG] check_pull_replication_log: completed_count=$completed_count, expected_count=$expected_count" >&2
 
   # If we have expected count, check if enough repos have completed
   if [ "$expected_count" -gt 0 ]; then
     # Require at least 90% of expected repos to have completed
     local min_completed=$((expected_count * 9 / 10))
+    [ "$debug" = "true" ] && echo "    [DEBUG] min_completed (90%)=$min_completed" >&2
     if [ "$completed_count" -ge "$min_completed" ]; then
+      [ "$debug" = "true" ] && echo "    [DEBUG] Returning success: $completed_count >= $min_completed" >&2
       return 0  # Enough repos completed
     fi
-    # Also check if replication is still actively progressing
-    # by looking for recent activity (within last few lines)
-    local recent_activity
-    recent_activity=$(docker exec "$cid" tail -n 5 /var/gerrit/logs/pull_replication_log 2>/dev/null | \
-      grep -iE "started|Running fetch|completed" || echo "")
-    if [ -n "$recent_activity" ]; then
-      return 1  # Still in progress
-    fi
+    # If we haven't reached min_completed yet, return failure to keep waiting
+    # (Don't return failure just because there's recent activity - that's expected!)
+    [ "$debug" = "true" ] && echo "    [DEBUG] Not enough repos completed yet: $completed_count < $min_completed" >&2
+    return 1
   else
     # No expected count - just check for any completion
     if [ "$completed_count" -gt 0 ]; then
+      [ "$debug" = "true" ] && echo "    [DEBUG] No expected count, but found $completed_count completions" >&2
       return 0
     fi
   fi
@@ -417,8 +422,23 @@ wait_for_replication() {
     # 3. Disk usage indicates real content (not just empty bare repos)
     if [ "$expected_count" -gt 0 ] && [ "$current_count" -ge "$expected_count" ]; then
       # Check for actual content - empty bare repos are tiny (~150KB each)
-      # 392 empty repos = ~60MB, real ONAP content should be 2+GB
-      if check_replication_has_content "$cid" "$expected_count" && check_pull_replication_log "$cid" "$expected_count"; then
+      # Content size varies greatly by server:
+      #   - ONAP: 2+GB (large codebase)
+      #   - LF: ~86MB (smaller infra tools)
+      # We use check_replication_has_content which estimates 1MB per repo minimum
+      local has_content=false
+      local log_ok=false
+
+      if check_replication_has_content "$cid" "$expected_count"; then
+        has_content=true
+      fi
+      if check_pull_replication_log "$cid" "$expected_count"; then
+        log_ok=true
+      fi
+
+      [ "${DEBUG:-false}" = "true" ] && echo "  [DEBUG] has_content=$has_content, log_ok=$log_ok, current_count=$current_count, expected=$expected_count" >&2
+
+      if [ "$has_content" = "true" ] && [ "$log_ok" = "true" ]; then
         echo ""
         echo "  ✅ Replication complete: $current_count/$expected_count repositories"
         echo "  ✅ Content verified: ${current_size_mb}MB fetched"
@@ -445,8 +465,9 @@ wait_for_replication() {
       # Each repo may complete multiple times (on each poll cycle), so we count unique
       # Use portable sed (not awk with capture groups which requires gawk)
       # Extract project name: everything after /a/ and before .git
+      # Exclude All-Projects and All-Users (system repos) to match count_repositories
       local unique_completed
-      unique_completed=$(docker exec "$cid" sh -c "grep 'Replication from .* completed' /var/gerrit/logs/pull_replication_log 2>/dev/null | sed 's|.*Replication from .*/a/||; s|\\.git completed.*||' | sort -u | wc -l" 2>/dev/null)
+      unique_completed=$(docker exec "$cid" sh -c "grep 'Replication from .* completed' /var/gerrit/logs/pull_replication_log 2>/dev/null | sed 's|.*Replication from .*/a/||; s|\\.git completed.*||' | grep -v -E '^All-Projects\$|^All-Users\$' | sort -u | wc -l" 2>/dev/null)
       # Ensure unique_completed is a valid integer (strip non-digits, default to 0)
       unique_completed="${unique_completed//[^0-9]/}"
       unique_completed="${unique_completed:-0}"

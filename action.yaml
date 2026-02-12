@@ -507,6 +507,7 @@ runs:
       env:
         SSH_AUTH_KEYS: ${{ inputs.ssh_auth_keys }}
         SSH_AUTH_USERNAME: ${{ inputs.ssh_auth_username }}
+        USE_API_PATH: ${{ inputs.use_api_path }}
         DEBUG: ${{ inputs.debug }}
       run: |
         # Add SSH authentication keys for user access

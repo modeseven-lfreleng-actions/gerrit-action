@@ -535,6 +535,16 @@ configure_gerrit() {
   # Set auth to development mode for testing
   git config -f "$config_file" auth.type "DEVELOPMENT_BECOME_ANY_ACCOUNT"
 
+  # Enable OOTB (Out Of The Box) filter for automatic account creation
+  # This is required for DEVELOPMENT_BECOME_ANY_ACCOUNT mode to work properly.
+  # Without this, accessing /login/?account_id=X returns "Account Not Found"
+  # instead of auto-creating the account.
+  git config -f "$config_file" httpd.filterClass "com.googlesource.gerrit.plugins.ootb.FirstTimeRedirect"
+  git config -f "$config_file" httpd.firstTimeRedirectUrl "/login/%23%2F?account_id=1000000"
+
+  # Enable remote plugin admin
+  git config -f "$config_file" plugins.allowRemoteAdmin "true"
+
   # Container user - run as the gerrit user (UID 1000) for security
   # Directories are chowned to match this UID during init_gerrit_site
   git config -f "$config_file" container.user "gerrit"
