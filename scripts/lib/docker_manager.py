@@ -254,8 +254,8 @@ class DockerManager:
             args.extend(["-p", f"{host_port}:{container_port}"])
         for host_path, container_path in (volumes or {}).items():
             # Support read-only mounts: if host_path ends with :ro, keep it
-            if ":ro" in host_path:
-                base_path = host_path.replace(":ro", "")
+            if host_path.endswith(":ro"):
+                base_path = host_path[:-3]
                 args.extend(["-v", f"{base_path}:{container_path}:ro"])
             else:
                 args.extend(["-v", f"{host_path}:{container_path}"])

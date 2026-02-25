@@ -565,14 +565,14 @@ runs:
       shell: bash
       run: |
         # Containers will continue/persist (Python)
-        python3 -c "
+        python3 - <<'PY'
         import json, os, pathlib
         summary = os.environ.get('GITHUB_STEP_SUMMARY', '')
         if not summary:
             exit(0)
         lines = ['**Containers Status** 🐳', '',
                  'Containers have detached and will continue/persist', '',
-                 'To manually cleanup later, run:', '\`\`\`bash']
+                 'To manually cleanup later, run:', '```bash']
         instances_path = pathlib.Path(os.environ.get('WORK_DIR', '')) / 'instances.json'
         if instances_path.is_file():
             data = json.loads(instances_path.read_text())
@@ -580,7 +580,7 @@ runs:
                 cid = data[slug].get('cid', '')
                 if cid:
                     lines.append(f'docker kill {cid}')
-        lines.extend(['\`\`\`', ''])
+        lines.extend(['```', ''])
         with open(summary, 'a') as fh:
             fh.write('\n'.join(lines) + '\n')
-        "
+        PY

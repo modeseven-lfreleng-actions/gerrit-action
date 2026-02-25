@@ -232,8 +232,15 @@ class ActionConfig:
             logger.warning("TUNNEL_PORTS is not valid JSON, ignoring")
             return {}
 
+        if not isinstance(raw, dict):
+            logger.warning("TUNNEL_PORTS is not a JSON object, ignoring")
+            return {}
+
         result: dict[str, TunnelConfig] = {}
         for slug, ports in raw.items():
+            if not isinstance(ports, dict):
+                logger.warning("Invalid tunnel port entry for %s, ignoring", slug)
+                continue
             http_port = ports.get("http")
             ssh_port = ports.get("ssh")
             if http_port and ssh_port:

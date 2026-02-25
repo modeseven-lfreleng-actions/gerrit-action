@@ -262,17 +262,14 @@ def diagnose_host(host: str, port: int) -> list[str]:
         diag.append(f"DNS resolution FAILED: {exc}")
         return diag  # no point trying TCP if DNS fails
 
-    # Raw TCP connect
+    # Raw TCP connect (use create_connection to handle IPv4/IPv6)
     for ip in unique_ips[:3]:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
         try:
-            sock.connect((ip, port))
+            sock = socket.create_connection((ip, port), timeout=5.0)
+            sock.close()
             diag.append(f"TCP connect to {ip}:{port}: OK")
         except OSError as exc:
             diag.append(f"TCP connect to {ip}:{port}: FAILED ({exc})")
-        finally:
-            sock.close()
 
     return diag
 

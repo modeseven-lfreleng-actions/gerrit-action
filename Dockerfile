@@ -79,14 +79,14 @@ ENV UV_TOOL_DIR=/opt/uv-tools
 ENV UV_TOOL_BIN_DIR=/opt/uv-tools/bin
 RUN mkdir -p /opt/uv-tools/bin && chmod 755 /opt/uv-tools
 
-# --- gerrit-to-platform: version-pinned install from requirements file -------
+# --- gerrit-to-platform: hash-verified install from requirements file --------
 # The pinned version (with hash) lives in docker/requirements.txt and is
 # kept up-to-date automatically by Dependabot (pip ecosystem, directory: /docker).
 COPY docker/requirements.txt /tmp/docker-requirements.txt
 
 RUN set -eux; \
-    G2P_VERSION=$(grep -oP 'gerrit-to-platform==\K[0-9][0-9.]*' /tmp/docker-requirements.txt); \
-    /usr/local/bin/uv tool install "gerrit-to-platform==${G2P_VERSION}"; \
+    python3 -m pip install --no-cache-dir --require-hashes \
+        -r /tmp/docker-requirements.txt; \
     rm /tmp/docker-requirements.txt
 
 # Create a Python virtual environment for the Gerrit API scripts
@@ -95,17 +95,11 @@ ENV GERRIT_SCRIPTS_VENV=/opt/gerrit-scripts
 RUN python3 -m venv $GERRIT_SCRIPTS_VENV && \
     $GERRIT_SCRIPTS_VENV/bin/pip install --no-cache-dir requests
 
-# Make tool binaries accessible system-wide
-RUN ln -sf /opt/uv-tools/bin/change-merged /usr/local/bin/change-merged && \
-    ln -sf /opt/uv-tools/bin/comment-added /usr/local/bin/comment-added && \
-    ln -sf /opt/uv-tools/bin/patchset-created /usr/local/bin/patchset-created
-
 # Verify installations work as root
 RUN set -eux; \
     echo "=== Verifying as root ===" && \
     uv --version && \
     uvx --version && \
-    uv tool list && \
     change-merged --help | head -5 || echo "Note: change-merged requires args" && \
     $GERRIT_SCRIPTS_VENV/bin/python -c "import requests; print('requests:', requests.__version__)" && \
     echo "=== Root verification complete ==="

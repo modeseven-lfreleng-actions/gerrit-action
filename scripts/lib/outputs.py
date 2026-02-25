@@ -54,8 +54,10 @@ def write_output(name: str, value: str) -> None:
     try:
         with open(output_file, "a", encoding="utf-8") as fh:
             if "\n" in value:
-                # Multi-line value – use heredoc delimiter
-                fh.write(f"{name}<<EOF\n{value}\nEOF\n")
+                # Multi-line value – use unique heredoc delimiter
+                # to avoid collisions if the value contains "EOF"
+                delim = f"ghadelim_{id(value):x}{len(value):x}"
+                fh.write(f"{name}<<{delim}\n{value}\n{delim}\n")
             else:
                 fh.write(f"{name}={value}\n")
         logger.debug("Wrote output %s (%d chars)", name, len(value))
