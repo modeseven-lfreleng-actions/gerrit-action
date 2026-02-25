@@ -3,8 +3,11 @@
 # SPDX-FileCopyrightText: 2025 The Linux Foundation
 
 ci:
-  # pre-commit.ci sandbox prevents network calls; disable gha-workflow-linter
-  skip: [gha-workflow-linter]
+  # pre-commit.ci sandbox lacks network access and project venv;
+  # skip basedpyright (needs venv for import resolution),
+  # gha-workflow-linter (needs network for schema fetching), and
+  # check-uv-checksum (needs network to fetch published checksums)
+  skip: [basedpyright, gha-workflow-linter, check-uv-checksum]
   autofix_commit_msg: |
     Chore: pre-commit autofixes
 
@@ -64,6 +67,8 @@ repos:
     rev: a66e98df7b4aeeb3724184b332785976d062b92e  # frozen: v1.19.1
     hooks:
       - id: mypy
+        additional_dependencies:
+          - types-requests>=2.28.0
 
   - repo: https://github.com/btford/write-good
     rev: ab66ce10136dfad5146e69e70f82a3efac8842c1 # frozen: v1.0.8
@@ -101,10 +106,25 @@ repos:
     hooks:
       - id: codespell
 
+  - repo: https://github.com/DetachHead/basedpyright-prek-mirror
+    rev: 1.38.1
+    hooks:
+      - id: basedpyright
+
   - repo: https://github.com/lfreleng-actions/gha-workflow-linter
     rev: a7caf8f3a1a05688d1cee46615ff94def617e5a3  # frozen: v1.0.2
     hooks:
       - id: gha-workflow-linter
+
+  # Verify uv binary checksum in Dockerfile stays in sync with upstream
+  - repo: local
+    hooks:
+      - id: check-uv-checksum
+        name: Verify uv checksum in Dockerfile
+        language: script
+        entry: scripts/check-uv-checksum.sh
+        files: ^Dockerfile$
+        pass_filenames: false
 
   - repo: https://github.com/python-jsonschema/check-jsonschema
     rev: ec368acd16deee9c560c105ab6d27db4ee19a5ec  # frozen: 0.36.2

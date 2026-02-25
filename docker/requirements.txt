@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 The Linux Foundation
+#
+# Pinned Python dependencies for the extended Gerrit Docker image.
+# Managed by Dependabot (pip ecosystem, directory: /docker).
+#
+# To regenerate hashes after a version bump:
+#   pip hash --algorithm sha256 \
+#     $(pip download --no-deps --dest /tmp gerrit-to-platform==<version> 2>&1 \
+#       | grep -oP 'Saved \K.*')
+#
+gerrit-to-platform==0.3.1 \
+    --hash=sha256:6aab2b9e555f5af4c6e3c096b767f198712ef6799658bdd64354abc50e24d646
