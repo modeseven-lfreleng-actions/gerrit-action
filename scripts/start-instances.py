@@ -33,6 +33,7 @@ Usage::
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import shutil
@@ -614,6 +615,7 @@ def configure_gerrit(
     api_path: str,
     advertised_ssh_addr: str,
     use_tunnel: bool,
+    tunnel_host: str = "",
 ) -> None:
     """Write ``gerrit.config`` settings via ``git config``.
 
@@ -668,11 +670,18 @@ def configure_gerrit(
     # Remote plugin admin
     if use_tunnel:
         _gc("plugins.allowRemoteAdmin", "false")
-        logger.warning(
-            "⚠️  Tunnel mode active with DEVELOPMENT_BECOME_ANY_ACCOUNT auth."
-        )
-        logger.warning("   Anyone with network access can authenticate as any user.")
-        logger.warning("   Remote plugin admin has been disabled to limit exposure.")
+        if _is_private_tunnel(tunnel_host):
+            logger.info("Tunnel mode active (private network — remote admin disabled).")
+        else:
+            logger.warning(
+                "⚠️  Tunnel mode active with DEVELOPMENT_BECOME_ANY_ACCOUNT auth."
+            )
+            logger.warning(
+                "   Anyone with network access can authenticate as any user."
+            )
+            logger.warning(
+                "   Remote plugin admin has been disabled to limit exposure."
+            )
     else:
         _gc("plugins.allowRemoteAdmin", "true")
 
@@ -842,6 +851,33 @@ def capture_ssh_host_keys(
 # =====================================================================
 
 
+def _is_private_tunnel(tunnel_host: str) -> bool:
+    """Check whether the tunnel host is a private or VPN address.
+
+    Returns ``True`` when *tunnel_host* is an IPv4 address inside one of
+    the RFC 1918 private ranges (``10.0.0.0/8``, ``172.16.0.0/12``,
+    ``192.168.0.0/16``) or the CGNAT range (``100.64.0.0/10``, which
+    includes Tailscale addresses).  Hostnames that cannot be parsed as
+    an IP address (e.g. ``bore.pub``) are treated as public and return
+    ``False``.
+    """
+    if not tunnel_host:
+        return False
+
+    try:
+        addr = ipaddress.ip_address(tunnel_host)
+    except ValueError:
+        return False
+
+    private_networks = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("100.64.0.0/10"),
+    )
+    return any(addr in net for net in private_networks)
+
+
 def _resolve_tunnel(
     slug: str,
     config: ActionConfig,
@@ -961,6 +997,7 @@ def start_instance(
         api_path,
         advertised_ssh_addr,
         use_tunnel,
+        tunnel_host=config.tunnel_host,
     )
 
     # Step 3: Plugins

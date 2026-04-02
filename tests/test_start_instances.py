@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -1134,6 +1135,7 @@ class TestConfigureGerrit:
         assert len(auth_calls) == 1
 
     def test_tunnel_mode_disables_remote_admin(self, tmp_path: Path) -> None:
+        """Public tunnel disables remote plugin admin."""
         instance_dir = tmp_path / "instance"
         (instance_dir / "etc").mkdir(parents=True)
         (instance_dir / "etc" / "gerrit.config").write_text("")
@@ -1153,19 +1155,106 @@ class TestConfigureGerrit:
                 "",
                 "tunnel.example.com:12345",
                 True,
+                tunnel_host="bore.pub",
             )
 
         admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
         assert any("false" in c for c in admin_calls)
 
-    def test_no_tunnel_enables_remote_admin(self, tmp_path: Path) -> None:
+    def test_private_tunnel_no_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Private tunnel (Tailscale) disables admin without warnings."""
         instance_dir = tmp_path / "instance"
         (instance_dir / "etc").mkdir(parents=True)
         (instance_dir / "etc" / "gerrit.config").write_text("")
 
-        calls_made = []
+        calls_made: list[list[str]] = []
 
         def record_call(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            """Record subprocess invocations."""
+            calls_made.append(args[0])
+            return _cp()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="start_instances"),
+            patch("start_instances.subprocess.run", side_effect=record_call),
+        ):
+            start_instances.configure_gerrit(
+                instance_dir,
+                "test",
+                "http://100.100.50.1:8080/",
+                "http://*:8080/",
+                "",
+                "100.100.50.1:29418",
+                True,
+                tunnel_host="100.100.50.1",
+            )
+
+        admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
+        assert any("false" in c for c in admin_calls)
+
+        warning_msgs = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_msgs) == 0
+
+        info_msgs = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "private network" in r.message
+        ]
+        assert len(info_msgs) == 1
+
+    def test_public_tunnel_emits_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Public tunnel emits security warnings about dev auth."""
+        instance_dir = tmp_path / "instance"
+        (instance_dir / "etc").mkdir(parents=True)
+        (instance_dir / "etc" / "gerrit.config").write_text("")
+
+        calls_made: list[list[str]] = []
+
+        def record_call(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            """Record subprocess invocations."""
+            calls_made.append(args[0])
+            return _cp()
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="start_instances"),
+            patch("start_instances.subprocess.run", side_effect=record_call),
+        ):
+            start_instances.configure_gerrit(
+                instance_dir,
+                "test",
+                "http://bore.pub:8080/",
+                "http://*:8080/",
+                "",
+                "bore.pub:12345",
+                True,
+                tunnel_host="bore.pub",
+            )
+
+        admin_calls = [c for c in calls_made if "plugins.allowRemoteAdmin" in c]
+        assert any("false" in c for c in admin_calls)
+
+        warning_msgs = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "DEVELOPMENT_BECOME_ANY_ACCOUNT" in r.message
+        ]
+        assert len(warning_msgs) >= 1
+
+    def test_no_tunnel_enables_remote_admin(self, tmp_path: Path) -> None:
+        """No tunnel enables remote plugin admin."""
+        instance_dir = tmp_path / "instance"
+        (instance_dir / "etc").mkdir(parents=True)
+        (instance_dir / "etc" / "gerrit.config").write_text("")
+
+        calls_made: list[list[str]] = []
+
+        def record_call(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            """Record subprocess invocations."""
             calls_made.append(args[0])
             return _cp()
 
@@ -1211,6 +1300,46 @@ class TestConfigureGerrit:
         ]
         assert len(redirect_calls) == 1
         assert "/r/login/" in redirect_calls[0][-1]
+
+
+class TestIsPrivateTunnel:
+    """Tests for _is_private_tunnel()."""
+
+    def test_tailscale_ip(self) -> None:
+        """Tailscale IP in CGNAT range is private."""
+        assert start_instances._is_private_tunnel("100.100.50.1") is True
+
+    def test_cgnat_boundary(self) -> None:
+        """First usable address in CGNAT range is private."""
+        assert start_instances._is_private_tunnel("100.64.0.1") is True
+
+    def test_non_cgnat_100x(self) -> None:
+        """Address below CGNAT range is public."""
+        assert start_instances._is_private_tunnel("100.63.255.255") is False
+
+    def test_rfc1918_10x(self) -> None:
+        """RFC 1918 10.0.0.0/8 address is private."""
+        assert start_instances._is_private_tunnel("10.0.0.1") is True
+
+    def test_rfc1918_172_16x(self) -> None:
+        """RFC 1918 172.16.0.0/12 address is private."""
+        assert start_instances._is_private_tunnel("172.16.0.1") is True
+
+    def test_rfc1918_192_168x(self) -> None:
+        """RFC 1918 192.168.0.0/16 address is private."""
+        assert start_instances._is_private_tunnel("192.168.1.1") is True
+
+    def test_public_ip(self) -> None:
+        """Public IP address is not private."""
+        assert start_instances._is_private_tunnel("8.8.8.8") is False
+
+    def test_hostname(self) -> None:
+        """Hostname that is not an IP returns False."""
+        assert start_instances._is_private_tunnel("bore.pub") is False
+
+    def test_empty_string(self) -> None:
+        """Empty string returns False."""
+        assert start_instances._is_private_tunnel("") is False
 
 
 # =====================================================================
