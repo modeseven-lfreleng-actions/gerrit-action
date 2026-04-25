@@ -1059,7 +1059,15 @@ class TestCheckOrgSecrets:
         assert result.severity == "warning"
 
     @patch("g2p_github.urlopen")
-    def test_optional_missing_warns(self, mock_urlopen: MagicMock) -> None:
+    def test_optional_missing_passes_as_info(self, mock_urlopen: MagicMock) -> None:
+        """Missing OPTIONAL secret is informational, not a warning.
+
+        ``GERRIT_SSH_PRIVKEY_G2G`` is only relevant to orgs that run
+        gerrit-to-gerrit replication; its absence in the standard
+        Gerrit -> GitHub flow is expected and must not produce
+        warnings or fail the audit.  The optional name is still
+        recorded in ``details['missing_optional']`` for visibility.
+        """
         mock_urlopen.return_value = _make_urlopen_response(
             200,
             {
@@ -1068,9 +1076,12 @@ class TestCheckOrgSecrets:
             },
         )
         result = check_org_secrets("ghp_token", "test-org")
-        assert result.passed is False
-        assert result.severity == "warning"
+        assert result.passed is True
+        assert result.severity == "info"
         assert "GERRIT_SSH_PRIVKEY_G2G" in result.details.get("missing_optional", [])
+        # Message keeps the breadcrumb so the optional gap is still
+        # discoverable in logs and the step summary table.
+        assert "optional missing" in result.message
 
 
 # ===================================================================

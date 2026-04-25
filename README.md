@@ -836,9 +836,17 @@ Required org-level items checked (and provisioned in `provision` mode):
 - **Variables**: `GERRIT_SERVER`, `GERRIT_SSH_USER`, `GERRIT_KNOWN_HOSTS`,
   `GERRIT_URL`
 
-An optional `GERRIT_SSH_PRIVKEY_G2G` secret is reported when missing
-but never blocks the run; it is only needed by orgs that perform
-gerrit-to-gerrit replication.
+An optional `GERRIT_SSH_PRIVKEY_G2G` secret is recorded for
+visibility but never blocks the run and never appears as a
+warning. It is the SSH private key used by **gerrit-to-gerrit
+(G2G) replication** — when one Gerrit instance pushes changes to
+*another* Gerrit instance rather than to GitHub. Most LF
+deployments only mirror Gerrit → GitHub via the G2P flow this
+action configures, so the secret is irrelevant and its absence is
+expected. Orgs that *do* run G2G replication should populate the
+secret out of band; the audit reports it as `found` once present.
+This action does not configure or provision G2G replication
+itself.
 
 #### Re-run behaviour (always overwrite)
 

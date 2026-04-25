@@ -64,7 +64,22 @@ REQUIRED_ORG_SECRETS: tuple[str, ...] = ("GERRIT_SSH_PRIVKEY",)
 """Secrets that must exist at the org level."""
 
 OPTIONAL_ORG_SECRETS: tuple[str, ...] = ("GERRIT_SSH_PRIVKEY_G2G",)
-"""Secrets that are recommended but not required."""
+"""Secrets that are optional and reported only for visibility.
+
+The single entry here, ``GERRIT_SSH_PRIVKEY_G2G``, is the SSH
+private key used by **gerrit-to-gerrit (G2G) replication** — i.e.
+when a Gerrit instance pushes changes to *another* Gerrit instance
+rather than to GitHub.  Most LF deployments do not run G2G
+replication; they only mirror Gerrit → GitHub via the G2P workflow
+this action configures.
+
+Because the key is irrelevant to the standard Gerrit → GitHub
+flow, an absent ``GERRIT_SSH_PRIVKEY_G2G`` is reported with
+``passed=True, severity='info'`` so it neither appears in the
+warning stream nor blocks the run.  Orgs that *do* perform G2G
+replication should populate the secret out of band; the audit
+will record it as ``found`` once present.
+"""
 
 REQUIRED_ORG_VARIABLES: tuple[str, ...] = (
     "GERRIT_SERVER",
@@ -731,18 +746,20 @@ def check_org_secrets(
         )
 
     msg = f"All required org secrets present in '{owner}'"
-    severity = "info"
-    passed = True
     if missing_optional:
+        # Optional secrets (currently only GERRIT_SSH_PRIVKEY_G2G,
+        # used for gerrit-to-gerrit replication) are recorded for
+        # visibility but never demote the result to a warning or
+        # failure: most deployments do not need them, and surfacing
+        # them as advisories created noise on every run without
+        # actionable signal.  See OPTIONAL_ORG_SECRETS for context.
         msg += f" (optional missing: {missing_optional})"
-        severity = "warning"
-        passed = False
 
     return G2PCheckResult(
         check_name="org_secrets",
-        passed=passed,
+        passed=True,
         message=msg,
-        severity=severity,
+        severity="info",
         details=details,
     )
 
