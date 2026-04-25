@@ -727,6 +727,43 @@ with:
   check_service: false
 ```
 
+### G2P Hooks Not Firing
+
+If a Gerrit change is uploaded, reviewed, and merged but no
+GitHub Actions workflows run in the target organisation, the
+container is most likely missing the Gerrit `hooks` plugin.
+G2P relies on Gerrit invoking the symlinks under
+`/var/gerrit/hooks/` (`patchset-created`, `comment-added`,
+`change-merged`); without `hooks.jar` loaded as a plugin those
+symlinks are inert.
+
+Check whether the plugin is present in the running container:
+
+```bash
+docker exec <container_id> ls -la /var/gerrit/plugins/hooks.jar
+```
+
+If the file is missing, the site was initialised without
+`gerrit init --install-all-plugins`. Recent versions of this
+action pass `--batch --install-all-plugins` automatically, so
+the most likely cause is an older cached image or a manual
+override via `gerrit_init_args`. Re-run the deploy workflow
+with the cache disabled (or supply `gerrit_init_args` that does
+not suppress the default flags) to repopulate the bundled
+plugins.
+
+You can also confirm hooks fire correctly by tailing the
+container logs while uploading a patchset:
+
+```bash
+docker exec <container_id> tail -f /var/gerrit/logs/error_log \
+  /var/gerrit/logs/sshd_log
+```
+
+A successful G2P dispatch logs an entry such as
+`patchset-created hook executed` followed by an HTTP request to
+`api.github.com`.
+
 ### Authentication Issues
 
 Verify SSH key format:

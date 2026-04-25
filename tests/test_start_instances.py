@@ -1035,8 +1035,40 @@ class TestInitGerritSite:
         docker.run_ephemeral.assert_called_once()
         call_kwargs = docker.run_ephemeral.call_args
         assert call_kwargs[0][0] == "my-image:1.0"
-        assert call_kwargs[1]["command"] == ["init"]
+        # ``--batch`` keeps init non-interactive and
+        # ``--install-all-plugins`` ensures the bundled plugins
+        # (notably ``hooks.jar``) get copied into the mounted
+        # plugins/ directory.  Without this the mount would shadow
+        # the image's bundled set and Gerrit would start without
+        # the hooks plugin, silently breaking G2P.
+        assert call_kwargs[1]["command"] == [
+            "init",
+            "--batch",
+            "--install-all-plugins",
+        ]
         assert "CANONICAL_WEB_URL" in call_kwargs[1]["env"]
+
+    def test_appends_extra_init_args(self, tmp_path: Path) -> None:
+        """Extra init args from the action input get appended."""
+        docker = MagicMock()
+        docker.run_ephemeral.return_value = ""
+        instance_dir = tmp_path / "instance"
+
+        with patch.object(start_instances, "_chown_tree"):
+            start_instances.init_gerrit_site(
+                docker,
+                instance_dir,
+                "test",
+                "http://localhost:18080/",
+                "my-image:1.0",
+                extra_init_args="--no-auto-start, --dev",
+            )
+
+        command = docker.run_ephemeral.call_args[1]["command"]
+        # Canonical leading args are preserved; extras are appended
+        # after them in the order supplied (whitespace stripped).
+        assert command[:3] == ["init", "--batch", "--install-all-plugins"]
+        assert command[3:] == ["--no-auto-start", "--dev"]
 
     def test_volumes_map_subdirs(self, tmp_path: Path) -> None:
         docker = MagicMock()

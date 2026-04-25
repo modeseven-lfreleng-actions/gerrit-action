@@ -746,8 +746,11 @@ class TestSetupG2pHooks:
 
     def test_partial_availability(self) -> None:
         docker = _make_docker_mock()
-        # First call: patchset-created exists, second: comment-added missing
-        docker.exec_test.side_effect = [True, False]
+        # exec_test call sequence:
+        #   1. hooks.jar present?         -> True
+        #   2. patchset-created binary?    -> True
+        #   3. comment-added binary?       -> False
+        docker.exec_test.side_effect = [True, True, False]
         config = G2PConfig(
             enabled=True,
             github_owner="test",

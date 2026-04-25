@@ -52,6 +52,9 @@ GERRIT_USER_HOME = "/var/gerrit"
 GERRIT_HOOKS_DIR = f"{GERRIT_HOME}/hooks"
 """Directory where Gerrit looks for hook scripts."""
 
+GERRIT_PLUGINS_DIR = f"{GERRIT_HOME}/plugins"
+"""Directory where Gerrit loads plugin JARs from at startup."""
+
 GERRIT_ETC_DIR = f"{GERRIT_HOME}/etc"
 """Gerrit configuration directory."""
 
@@ -530,6 +533,19 @@ def setup_g2p_hooks(
 
     # Ensure the hooks directory exists
     docker.exec_cmd(cid, f"mkdir -p {GERRIT_HOOKS_DIR}", user="0")
+
+    # Verify the Gerrit ``hooks`` plugin is installed.  Without it
+    # Gerrit never invokes the scripts in /var/gerrit/hooks/, which
+    # would silently break G2P.  ``gerrit init --install-all-plugins``
+    # is responsible for placing hooks.jar; if it is missing here,
+    # the hook symlinks we create below will be inert.
+    if not docker.exec_test(cid, f"-f {GERRIT_PLUGINS_DIR}/hooks.jar"):
+        logger.warning(
+            "Gerrit 'hooks' plugin (hooks.jar) is missing from %s — "
+            "G2P hook scripts will not run.  Ensure the site is "
+            "initialised with 'gerrit init --install-all-plugins'.",
+            GERRIT_PLUGINS_DIR,
+        )
 
     for hook_name in config.hooks:
         target_bin = f"{GERRIT_TOOLS_VENV_BIN}/{hook_name}"

@@ -567,12 +567,19 @@ def init_gerrit_site(
     slug: str,
     canonical_url: str,
     image: str,
+    extra_init_args: str = "",
 ) -> None:
     """Initialise a Gerrit site directory using ``gerrit init``.
 
     Runs the Gerrit image with ``init`` as the command, mounting only
     the individual sub-directories (not the whole ``/var/gerrit``
     directory) so that ``/var/gerrit/bin`` from the image is preserved.
+
+    Parameters
+    ----------
+    extra_init_args:
+        Optional comma-separated list of additional arguments to pass
+        to ``gerrit init`` (from the ``gerrit_init_args`` action input).
     """
     logger.info("Initializing Gerrit site for %s…", slug)
 
@@ -587,11 +594,28 @@ def init_gerrit_site(
     volumes = {str(instance_dir / sub): f"/var/gerrit/{sub}" for sub in _GERRIT_SUBDIRS}
 
     try:
+        # Pass --batch so init never prompts, and
+        # --install-all-plugins so the bundled plugins from the
+        # image (hooks, download-commands, delete-project,
+        # webhooks, singleusergroup, reviewnotes, etc.) get copied
+        # into the mounted plugins/ directory.  Without this the
+        # mount shadows the image's bundled plugins and Gerrit
+        # starts without the hooks plugin — which silently breaks
+        # G2P because Gerrit never invokes the symlinks in
+        # /var/gerrit/hooks/.
+        command = ["init", "--batch", "--install-all-plugins"]
+        if extra_init_args.strip():
+            # Honour any user-supplied extras (comma-separated).
+            for extra in extra_init_args.split(","):
+                extra = extra.strip()
+                if extra:
+                    command.append(extra)
+
         docker.run_ephemeral(
             image,
             volumes=volumes,
             env={"CANONICAL_WEB_URL": canonical_url},
-            command=["init"],
+            command=command,
             timeout=180,
         )
     except DockerError as exc:
@@ -989,7 +1013,14 @@ def start_instance(
     instance_dir = config.work_path / "instances" / slug
 
     # Step 1: Init site
-    init_gerrit_site(docker, instance_dir, slug, canonical_url, image)
+    init_gerrit_site(
+        docker,
+        instance_dir,
+        slug,
+        canonical_url,
+        image,
+        extra_init_args=config.gerrit_init_args,
+    )
 
     # Step 2: Configure
     configure_gerrit(
