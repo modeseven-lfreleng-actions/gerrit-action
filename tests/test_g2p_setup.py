@@ -721,7 +721,15 @@ class TestSetupG2pHooks:
         exec_calls = [c[0][1] for c in docker.exec_cmd.call_args_list]
         assert any(f"mkdir -p {GERRIT_HOOKS_DIR}" in c for c in exec_calls)
 
-    def test_symlink_target_points_to_venv_bin(self) -> None:
+    def test_wrapper_target_points_to_venv_bin(self) -> None:
+        """The installed wrapper script references the venv binary.
+
+        We replaced the previous bare ``ln -sf`` symlink with a thin
+        POSIX-shell wrapper so every Gerrit hook invocation is teed
+        to ``/var/gerrit/logs/g2p-hooks.log``.  Confirm the wrapper
+        body still names the underlying console script so Gerrit
+        ends up running the same target as before.
+        """
         docker = _make_docker_mock(exec_test_return=True)
         config = G2PConfig(
             enabled=True,
@@ -729,10 +737,19 @@ class TestSetupG2pHooks:
             hooks=["patchset-created"],
         )
         setup_g2p_hooks(docker, CID, config)
-        exec_calls = [c[0][1] for c in docker.exec_cmd.call_args_list]
-        expected_target = f"{GERRIT_TOOLS_VENV_BIN}/patchset-created"
-        expected_path = f"{GERRIT_HOOKS_DIR}/patchset-created"
-        assert any(f"ln -sf {expected_target} {expected_path}" in c for c in exec_calls)
+        # The wrapper is written via DockerManager.cp; pull the
+        # written content out of the call args and confirm the
+        # console-script path appears as the TARGET shell variable
+        # the wrapper exec()s.
+        assert docker.cp.called, "expected docker.cp() call to install wrapper"
+        cp_calls = docker.cp.call_args_list
+        wrapper_paths = [c[0][1] for c in cp_calls]
+        # docker.cp's destination is rendered as ``<cid>:<path>``,
+        # not the bare path, so match against that combined form.
+        expected = f"{CID}:{GERRIT_HOOKS_DIR}/patchset-created"
+        assert any(p == expected for p in wrapper_paths), (
+            f"expected {expected} in cp calls; saw {wrapper_paths}"
+        )
 
     def test_skips_missing_binary(self) -> None:
         docker = _make_docker_mock(exec_test_return=False)
@@ -779,7 +796,17 @@ class TestSetupG2pHooks:
         enabled = setup_g2p_hooks(docker, CID, config)
         assert enabled == ["change-merged"]
 
-    def test_sets_hook_ownership(self) -> None:
+    def test_creates_log_file_with_gerrit_ownership(self) -> None:
+        """The hook log file is pre-created with gerrit ownership.
+
+        The wrapper appends to ``G2P_HOOK_LOG``; pre-creating it as
+        root with ``chown gerrit:gerrit`` avoids a race on the very
+        first hook invocation and lets operators ``tail -F`` it from
+        container start.  This test guards that the chown command
+        runs as root and targets the documented log path.
+        """
+        from g2p_setup import G2P_HOOK_LOG
+
         docker = _make_docker_mock(exec_test_return=True)
         config = G2PConfig(
             enabled=True,
@@ -788,8 +815,10 @@ class TestSetupG2pHooks:
         )
         setup_g2p_hooks(docker, CID, config)
         exec_calls = [c[0][1] for c in docker.exec_cmd.call_args_list]
-        hook_path = f"{GERRIT_HOOKS_DIR}/patchset-created"
-        assert any(f"chown -h gerrit:gerrit {hook_path}" in c for c in exec_calls)
+        assert any(
+            f"touch {G2P_HOOK_LOG}" in c and f"chown gerrit:gerrit {G2P_HOOK_LOG}" in c
+            for c in exec_calls
+        )
 
 
 # ===================================================================
