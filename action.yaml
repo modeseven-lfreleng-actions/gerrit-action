@@ -122,6 +122,21 @@ inputs:
       Set to a higher value if you need to replicate more projects.
     required: false
     default: '800'
+  skip_archived_projects:
+    description: |
+      Skip archived (``READ_ONLY``) and hidden projects when fetching
+      the project list from the source Gerrit.  When ``'true'`` (the
+      default) the action passes ``?state=ACTIVE`` to the source
+      Gerrit's ``/projects/`` REST endpoint so archived projects are
+      filtered out server-side and never get pre-created locally;
+      pull-replication consequently does not mirror them, which can
+      roughly halve initial sync time on instances that carry a large
+      historical archive (ONAP is 181 active + 214 read_only = 395
+      total).  Set to ``'false'`` to mirror archived projects too —
+      necessary when debugging or backfilling a specific archived
+      repository.
+    required: false
+    default: 'true'
   require_replication_success:
     description: |
       If true and sync_on_startup is true, the workflow will fail
@@ -636,6 +651,7 @@ runs:
         TUNNEL_HOST: ${{ inputs.tunnel_host }}
         TUNNEL_PORTS: ${{ inputs.tunnel_ports }}
         MAX_PROJECTS: ${{ inputs.max_projects }}
+        SKIP_ARCHIVED_PROJECTS: ${{ inputs.skip_archived_projects }}
       run: |
         # Start Gerrit instances (Python)
         python3 "${{ github.action_path }}/scripts/start-instances.py"

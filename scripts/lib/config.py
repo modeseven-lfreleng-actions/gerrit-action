@@ -172,6 +172,17 @@ class ActionConfig:
     debug: bool = False
     use_api_path: bool = False
     max_projects: int = 500
+    # When true (the default), the project list fetched from the
+    # source Gerrit is restricted to projects in state ``ACTIVE``,
+    # i.e. ``READ_ONLY`` (archived) and ``HIDDEN`` projects are
+    # excluded.  This is implemented at the REST query level via
+    # ``?state=ACTIVE`` so the source Gerrit does the filtering and
+    # we never enumerate archived projects locally.  Set to false
+    # via the ``SKIP_ARCHIVED_PROJECTS=false`` env var (or the
+    # equivalent ``skip_archived_projects`` action input) to mirror
+    # archived projects too — useful when debugging a specific
+    # archived repository, at the cost of a longer replication.
+    skip_archived_projects: bool = True
 
     # Tunnelling
     tunnel_host: str = ""
@@ -334,6 +345,7 @@ class ActionConfig:
             debug=_str_to_bool(env("DEBUG", "false")),
             use_api_path=_str_to_bool(env("USE_API_PATH", "false")),
             max_projects=default_max_projects,
+            skip_archived_projects=_str_to_bool(env("SKIP_ARCHIVED_PROJECTS", "true")),
             tunnel_host=env("TUNNEL_HOST", ""),
             tunnel_ports_json=env("TUNNEL_PORTS", ""),
             ssh_auth_keys=env("SSH_AUTH_KEYS", ""),

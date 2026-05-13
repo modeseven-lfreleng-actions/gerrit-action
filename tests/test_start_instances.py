@@ -525,6 +525,37 @@ class TestFetchRemoteProjects:
         url = mock_get.call_args[0][0]
         assert "n=42" in url
 
+    def test_skip_archived_default_appends_state_active(self) -> None:
+        """Default config skips archived via ``?state=ACTIVE``."""
+        config = _make_config()
+        assert config.skip_archived_projects is True
+        mock_resp = MagicMock()
+        mock_resp.text = ")]}'\n{}"
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
+            start_instances.fetch_remote_projects(
+                "gerrit.example.org", "", "", 100, config
+            )
+
+        url = mock_get.call_args[0][0]
+        assert "state=ACTIVE" in url
+
+    def test_include_archived_omits_state_param(self) -> None:
+        """``skip_archived_projects=False`` keeps the legacy URL shape."""
+        config = _make_config(skip_archived_projects=False)
+        mock_resp = MagicMock()
+        mock_resp.text = ")]}'\n{}"
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("start_instances.requests.get", return_value=mock_resp) as mock_get:
+            start_instances.fetch_remote_projects(
+                "gerrit.example.org", "", "", 100, config
+            )
+
+        url = mock_get.call_args[0][0]
+        assert "state=" not in url
+
 
 # =====================================================================
 # generate_replication_config

@@ -293,6 +293,20 @@ def fetch_remote_projects(
     params: dict[str, str] = {"n": str(max_projects)}
     if project_filter and project_filter != ".*":
         params["r"] = project_filter
+    # Restrict to ACTIVE projects so READ_ONLY (archived) and HIDDEN
+    # projects are excluded server-side.  Gerrit's REST API natively
+    # supports the ``state`` query parameter, so we let the source
+    # do the filtering rather than fetching everything and dropping
+    # archived entries locally.  Operators who want archived repos
+    # mirrored too can set ``SKIP_ARCHIVED_PROJECTS=false`` (env) or
+    # ``skip_archived_projects: 'false'`` (action input).
+    if config.skip_archived_projects:
+        params["state"] = "ACTIVE"
+        logger.info("  Restricting to ACTIVE projects (SKIP_ARCHIVED_PROJECTS=true)")
+    else:
+        logger.info(
+            "  Including archived (READ_ONLY) projects (SKIP_ARCHIVED_PROJECTS=false)"
+        )
 
     query = "&".join(f"{k}={quote(v, safe='')}" for k, v in params.items())
     full_url = f"{base_url}?{query}"
