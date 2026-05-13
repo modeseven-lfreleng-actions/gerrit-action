@@ -343,16 +343,25 @@ def run() -> int:
 
     if g2p_config.org_setup != "skip":
         with log_group("G2P org-level audit (initial)"):
-            if g2p_config.github_token:
+            # Use the same token resolution as provisioning so the
+            # audit's read scope matches the elevated token a caller
+            # supplied via ``g2p_org_token_map``.  Without this, a
+            # least-privileged ``g2p_github_token`` would 403 the
+            # /orgs/.../actions/{secrets,variables} reads even when
+            # the operator carefully scoped an elevated org token
+            # for provisioning — making provision_org_config()
+            # blind to which items already exist.
+            audit_token = g2p_config.resolve_org_token()
+            if audit_token:
                 org_results.append(
                     check_org_secrets(
-                        g2p_config.github_token,
+                        audit_token,
                         g2p_config.github_owner,
                     )
                 )
                 org_results.append(
                     check_org_variables(
-                        g2p_config.github_token,
+                        audit_token,
                         g2p_config.github_owner,
                     )
                 )
@@ -506,29 +515,41 @@ def run() -> int:
     # -- Step 5c: Re-audit org state after provisioning -----------------
     # Replace the initial audit entries with fresh results so the
     # final JSON and summary reflect post-provisioning reality.
-    if (
-        g2p_config.org_setup == "provision"
-        and g2p_config.github_token
-        and org_provisioned
-    ):
-        with log_group("G2P org-level audit (post-provision)"):
-            fresh_secrets = check_org_secrets(
-                g2p_config.github_token,
-                g2p_config.github_owner,
+    #
+    # The re-audit runs unconditionally whenever ``provision`` mode is
+    # active (not just when ``org_provisioned`` is true): provisioning
+    # always overwrites required items, and the initial audit may have
+    # used the wrong token / hit a permission error, leaving stale or
+    # missing entries in ``org_results``.  Running the audit again with
+    # the same elevated token used for provisioning guarantees the
+    # final output reflects the true post-provision state.
+    if g2p_config.org_setup == "provision":
+        reaudit_token = g2p_config.resolve_org_token()
+        if reaudit_token:
+            with log_group("G2P org-level audit (post-provision)"):
+                fresh_secrets = check_org_secrets(
+                    reaudit_token,
+                    g2p_config.github_owner,
+                )
+                fresh_variables = check_org_variables(
+                    reaudit_token,
+                    g2p_config.github_owner,
+                )
+                # Keep any non-secret/variable entries (e.g. error
+                # breadcrumbs) and replace the original org_secrets /
+                # org_variables entries with the refreshed ones.
+                preserved = [
+                    r
+                    for r in org_results
+                    if r.check_name not in ("org_secrets", "org_variables")
+                ]
+                org_results = [fresh_secrets, fresh_variables, *preserved]
+        else:
+            logger.warning(
+                "Skipping post-provision re-audit: no GitHub token "
+                "available; final g2p_org_audit_results reflects the "
+                "pre-provision state.",
             )
-            fresh_variables = check_org_variables(
-                g2p_config.github_token,
-                g2p_config.github_owner,
-            )
-            # Keep any non-secret/variable entries (e.g. error
-            # breadcrumbs) and replace the original org_secrets /
-            # org_variables entries with the refreshed ones.
-            preserved = [
-                r
-                for r in org_results
-                if r.check_name not in ("org_secrets", "org_variables")
-            ]
-            org_results = [fresh_secrets, fresh_variables, *preserved]
 
     # Recompute audit JSON after any provisioning / re-audit work
     if g2p_config.org_setup != "skip":

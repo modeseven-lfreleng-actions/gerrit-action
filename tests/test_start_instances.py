@@ -1080,7 +1080,7 @@ class TestInitGerritSite:
         assert "CANONICAL_WEB_URL" in call_kwargs[1]["env"]
 
     def test_appends_extra_init_args(self, tmp_path: Path) -> None:
-        """Extra init args from the action input get appended."""
+        """Extra init args parse with shell semantics (shlex.split)."""
         docker = MagicMock()
         docker.run_ephemeral.return_value = ""
         instance_dir = tmp_path / "instance"
@@ -1092,14 +1092,39 @@ class TestInitGerritSite:
                 "test",
                 "http://localhost:18080/",
                 "my-image:1.0",
-                extra_init_args="--no-auto-start, --dev",
+                extra_init_args="--no-auto-start --dev",
             )
 
         command = docker.run_ephemeral.call_args[1]["command"]
         # Canonical leading args are preserved; extras are appended
-        # after them in the order supplied (whitespace stripped).
+        # after them in the order supplied (shell-style tokenisation).
         assert command[:3] == ["init", "--batch", "--install-all-plugins"]
         assert command[3:] == ["--no-auto-start", "--dev"]
+
+    def test_extra_init_args_honours_quoted_values(self, tmp_path: Path) -> None:
+        """Quoted values stay as single argv tokens (shlex semantics)."""
+        docker = MagicMock()
+        docker.run_ephemeral.return_value = ""
+        instance_dir = tmp_path / "instance"
+
+        with patch.object(start_instances, "_chown_tree"):
+            start_instances.init_gerrit_site(
+                docker,
+                instance_dir,
+                "test",
+                "http://localhost:18080/",
+                "my-image:1.0",
+                extra_init_args='--config "value with spaces" --flag',
+            )
+
+        command = docker.run_ephemeral.call_args[1]["command"]
+        # The quoted ``value with spaces`` survives as a single
+        # element rather than being split on the embedded space.
+        assert command[3:] == [
+            "--config",
+            "value with spaces",
+            "--flag",
+        ]
 
     def test_volumes_map_subdirs(self, tmp_path: Path) -> None:
         docker = MagicMock()

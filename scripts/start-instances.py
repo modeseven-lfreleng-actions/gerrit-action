@@ -615,13 +615,20 @@ def init_gerrit_site(
         # into the mounted plugins/ directory.  Without this the
         # mount shadows the image's bundled plugins and Gerrit
         # starts without the hooks plugin — which silently breaks
-        # G2P because Gerrit never invokes the symlinks in
+        # G2P because Gerrit never invokes the wrapper scripts in
         # /var/gerrit/hooks/.
         command = ["init", "--batch", "--install-all-plugins"]
         if extra_init_args.strip():
-            # Honour any user-supplied extras (comma-separated).
-            for extra in extra_init_args.split(","):
-                extra = extra.strip()
+            # Honour any user-supplied extras.  Parse with
+            # ``shlex.split`` so callers can use the familiar
+            # shell-style whitespace-separated form
+            # (``--foo bar --baz``) and still get quoting handled
+            # correctly for values that contain spaces.  Each
+            # token becomes its own argv element, matching the
+            # behaviour ``gerrit init`` expects.
+            import shlex
+
+            for extra in shlex.split(extra_init_args):
                 if extra:
                     command.append(extra)
 

@@ -1106,11 +1106,19 @@ class GerritDevClient:
         """
         results: list[dict[str, Any]] = []
         deferred_failures: list[str] = []
+        # ``ssh_keys`` may include blank lines and ``#`` comments;
+        # the loop skips those without attempting any POST.  Tracking
+        # the number of keys we actually tried makes the summary log
+        # below match reality ("1 of 2 attempted failed" instead of
+        # the misleading "1 of 5 keys failed" when 3 of the 5 entries
+        # were comment/whitespace lines).
+        attempted = 0
 
         for key in ssh_keys:
             key = key.strip()
             if not key or key.startswith("#"):
                 continue
+            attempted += 1
             try:
                 result = self.add_ssh_key(account, key)
                 results.append(result)
@@ -1155,12 +1163,14 @@ class GerritDevClient:
             # Emit a single concise INFO line summarising any keys
             # that could not be added even after retry.  Downstream
             # auth still works for any keys that did land, and the
-            # admin-group setup proceeds regardless.
+            # admin-group setup proceeds regardless.  The total uses
+            # ``attempted`` rather than ``len(ssh_keys)`` so blank/
+            # comment-only entries do not inflate the denominator.
             logger.info(
                 "%d of %d SSH key(s) for %s could not be added "
                 "(non-fatal); proceeding without them",
                 len(deferred_failures),
-                len(ssh_keys),
+                attempted,
                 account,
             )
             # Surface the individual retry-path errors at DEBUG so they
