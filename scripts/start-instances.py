@@ -535,16 +535,39 @@ def generate_secure_config(
     slug: str,
     config: ActionConfig,
 ) -> None:
-    """Generate ``secure.config`` with authentication credentials."""
+    """Generate ``secure.config`` with authentication credentials.
+
+    Emits a per-remote section for every remote that
+    ``generate_replication_config`` writes into the matching
+    ``replication.config``.  When ``replicate_meta_refs`` is enabled
+    that includes the magic-repo remote (``<slug>-meta``) targeting
+    ``All-Users`` and ``All-Projects`` — without explicit credentials
+    here the plugin falls back to anonymous auth, which the source
+    Gerrit refuses with ``TransportException: not authorized``.
+    """
     auth_type = config.auth_type.lower()
 
     if auth_type == "http_basic":
-        content = (
+        sections = [
             f'[remote "{slug}"]\n'
             f"  username = {config.http_username}\n"
             f"  password = {config.http_password}\n"
-        )
+        ]
+        if config.replicate_meta_refs:
+            # Mirror the credentials onto the magic-repo remote so
+            # the matching ``[remote "<slug>-meta"]`` section emitted
+            # by generate_replication_config can authenticate against
+            # the source Gerrit when fetching All-Users / All-Projects.
+            sections.append(
+                f'[remote "{slug}-meta"]\n'
+                f"  username = {config.http_username}\n"
+                f"  password = {config.http_password}\n"
+            )
+        content = "".join(sections)
     elif auth_type == "bearer_token":
+        # Bearer-token auth applies globally to all remotes via the
+        # ``[auth]`` section, so no per-remote duplication is needed
+        # for the magic-repo remote.
         content = f"[auth]\n  bearerToken = {config.bearer_token}\n"
     else:
         # SSH auth — no secure.config needed

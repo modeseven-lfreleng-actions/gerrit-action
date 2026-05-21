@@ -996,6 +996,72 @@ class TestGenerateSecureConfig:
         mode = config_file.stat().st_mode & 0o777
         assert mode == 0o600
 
+    def test_http_basic_meta_refs_disabled_no_extra_section(
+        self, tmp_path: Path
+    ) -> None:
+        """With meta-refs off, the primary remote is the only section."""
+        config_file = tmp_path / "secure.config"
+        config = _make_config(
+            auth_type="http_basic",
+            http_username="admin",
+            http_password="secret123",
+            replicate_meta_refs=False,
+        )
+
+        start_instances.generate_secure_config(config_file, "onap", config)
+
+        content = config_file.read_text()
+        assert '[remote "onap"]' in content
+        assert '[remote "onap-meta"]' not in content
+
+    def test_http_basic_meta_refs_mirrors_credentials(self, tmp_path: Path) -> None:
+        """The magic-repo remote inherits the primary credentials.
+
+        Without this duplication the pull-replication plugin falls
+        back to anonymous auth on the ``<slug>-meta`` remote and
+        the source Gerrit rejects the All-Users / All-Projects
+        fetches with ``TransportException: not authorized``.
+        """
+        config_file = tmp_path / "secure.config"
+        config = _make_config(
+            auth_type="http_basic",
+            http_username="admin",
+            http_password="secret123",
+            replicate_meta_refs=True,
+        )
+
+        start_instances.generate_secure_config(config_file, "onap", config)
+
+        content = config_file.read_text()
+        # Primary remote credentials present.
+        assert '[remote "onap"]' in content
+        # Magic-repo remote inherits the same username/password.
+        assert '[remote "onap-meta"]' in content
+        # Both sections list the credentials.
+        assert content.count("username = admin") == 2
+        assert content.count("password = secret123") == 2
+
+    def test_bearer_token_meta_refs_no_per_remote_duplication(
+        self, tmp_path: Path
+    ) -> None:
+        """Bearer-token auth applies globally; no per-remote duplication needed."""
+        config_file = tmp_path / "secure.config"
+        config = _make_config(
+            auth_type="bearer_token",
+            bearer_token="tok-xyz",
+            replicate_meta_refs=True,
+        )
+
+        start_instances.generate_secure_config(config_file, "onap", config)
+
+        content = config_file.read_text()
+        # Only the global [auth] section — no per-remote magic-repo
+        # duplication because bearer-token auth applies to every
+        # fetch via the same header.
+        assert "[auth]" in content
+        assert "bearerToken = tok-xyz" in content
+        assert '[remote "onap-meta"]' not in content
+
 
 # =====================================================================
 # download_plugin
