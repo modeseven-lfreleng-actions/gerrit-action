@@ -646,14 +646,20 @@ def _test_no_false_errors(docker: DockerManager, cid: str) -> TestResult:
     Normal replication log activity (ASYNC started, completed, periodic
     fetch scheduling) should NOT be flagged as errors.
     """
-    has_errors = check_replication_errors(docker, cid)
+    report = check_replication_errors(docker, cid)
     log_tail = show_pull_replication_log(docker, cid, lines=10)
 
-    if has_errors:
+    if report.has_any_errors:
+        # Include the per-source/pattern attribution so a failure
+        # here points at the offending rule without a re-run.
+        diagnostics = " | ".join(report.format_matches(max_per_source=3))
         return TestResult(
             name="no_false_errors",
             passed=False,
-            message=f"check_replication_errors returned True — log tail: {log_tail[:200]}",
+            message=(
+                f"check_replication_errors flagged matches: {diagnostics} "
+                f"— log tail: {log_tail[:200]}"
+            ),
         )
     return TestResult(
         name="no_false_errors",

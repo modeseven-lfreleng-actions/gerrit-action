@@ -219,6 +219,120 @@ class _StabilityTracker:
         return self._prev_snapshot.timestamp - self._last_change_time
 
 
+@dataclass
+class ErrorMatch:
+    """A single line that matched a replication-error pattern.
+
+    Attributes
+    ----------
+    source:
+        Which log source the match came from.  One of
+        ``"pull_replication_log"`` (the per-event log file Gerrit's
+        pull-replication plugin writes) or ``"container_logs"`` (the
+        Gerrit container's combined stdout/stderr captured via
+        ``docker logs``).  Useful so callers can apply different
+        tolerance to the authoritative per-event log vs. the broader
+        heuristic container scan.
+    pattern:
+        The regex (string form) that matched the line.  Logged on
+        every detection so a re-run never leaves operators guessing
+        which rule fired.
+    line:
+        The matching line itself, with the trailing newline stripped.
+    """
+
+    source: str
+    pattern: str
+    line: str
+
+
+@dataclass
+class ReplicationErrorReport:
+    """Structured result from a replication-error scan.
+
+    Separates the per-event log (authoritative) from the broader
+    container log (advisory), so callers can choose tolerance per
+    source instead of fusing them into a single bool that throws
+    away which source and which pattern triggered.
+
+    The previous ``check_replication_errors() -> bool`` interface
+    made every detection a hard failure even when the only signal
+    came from container-startup chatter that happened to match the
+    deliberately-broad ``pull-replication.*(error|failed|exception)``
+    pattern.  Callers can now distinguish authoritative replication
+    failures (per-event log) from heuristic warnings (container log)
+    and decide independently how to react.
+    """
+
+    log_file_matches: list[ErrorMatch] = field(default_factory=list)
+    """Matches from ``/var/gerrit/logs/pull_replication_log``."""
+
+    container_log_matches: list[ErrorMatch] = field(default_factory=list)
+    """Matches from ``docker logs`` (container stdout/stderr)."""
+
+    @property
+    def has_authoritative_errors(self) -> bool:
+        """True when the per-event replication log has matches.
+
+        This is the high-confidence signal: every line in that file
+        is replication-related, so a pattern hit there reflects an
+        actual replication failure.
+        """
+        return bool(self.log_file_matches)
+
+    @property
+    def has_advisory_errors(self) -> bool:
+        """True when the container log has matches.
+
+        The container log captures everything Gerrit writes to
+        stdout/stderr (plugin loader, JVM startup, web UI, email).
+        Even with narrow patterns this source produces occasional
+        false positives during startup.  Callers should surface
+        these for diagnosis but not treat them as fatal on their
+        own.
+        """
+        return bool(self.container_log_matches)
+
+    @property
+    def has_any_errors(self) -> bool:
+        """True if either source produced at least one match."""
+        return self.has_authoritative_errors or self.has_advisory_errors
+
+    # ------------------------------------------------------------------
+    # Diagnostic helpers — collapse the report into log lines the
+    # caller can route to ``logger.warning`` / ``logger.error``.
+    # ------------------------------------------------------------------
+
+    def format_matches(self, *, max_per_source: int = 20) -> list[str]:
+        """Return human-readable lines describing every match.
+
+        Each block starts with a heading that identifies the source
+        and pattern, followed by up to *max_per_source* matching
+        lines indented for readability.  Returns an empty list when
+        there are no matches.
+        """
+        out: list[str] = []
+        for label, matches in (
+            ("pull_replication_log (authoritative)", self.log_file_matches),
+            ("container_logs (advisory)", self.container_log_matches),
+        ):
+            if not matches:
+                continue
+            # Group by pattern so callers can see which rule fired.
+            by_pattern: dict[str, list[str]] = {}
+            for m in matches:
+                by_pattern.setdefault(m.pattern, []).append(m.line)
+            for pattern, lines in by_pattern.items():
+                out.append(f"  {label} — pattern={pattern!r} — {len(lines)} match(es):")
+                for line in lines[:max_per_source]:
+                    out.append(f"    {line.rstrip()}")
+                if len(lines) > max_per_source:
+                    out.append(
+                        f"    … {len(lines) - max_per_source} more line(s) truncated"
+                    )
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Plugin and configuration checks
 # ---------------------------------------------------------------------------
@@ -285,21 +399,47 @@ def check_secure_config(docker: DockerManager, cid: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def check_replication_errors(docker: DockerManager, cid: str) -> bool:
-    """Check for replication errors in logs.
+def check_replication_errors(
+    docker: DockerManager,
+    cid: str,
+) -> ReplicationErrorReport:
+    """Scan replication-related logs for known error patterns.
 
-    The pull_replication_log is the **primary** source of truth.  We
-    also do a narrowly-scoped scan of container logs for replication-
-    specific patterns, but intentionally skip generic terms like
-    ``Connection refused`` or ``ERROR`` that frequently appear for
-    non-replication reasons (e.g. email delivery failures).
+    Two sources are scanned independently:
 
-    Returns *True* if errors were found (i.e. replication is failing).
+    * The per-event ``pull_replication_log`` file inside the Gerrit
+      container (the **authoritative** source — every line is
+      replication-related, so a pattern hit reflects an actual
+      replication failure).  Up to the last 500 lines are searched
+      for ``_REPLICATION_ERROR_PATTERNS``.
+    * ``docker logs`` against the Gerrit container (the **advisory**
+      source — captures everything Gerrit writes to stdout/stderr;
+      includes plugin loader output, JVM startup, web UI, email).
+      Up to the last 2000 lines are searched for the narrower
+      ``_CONTAINER_ERROR_PATTERNS``.
+
+    Returns a :class:`ReplicationErrorReport` that records every
+    matching line together with the source and the regex that fired.
+    Callers decide how to react: typically failures only on
+    ``has_authoritative_errors``, warnings on ``has_advisory_errors``.
+
+    The previous boolean interface fused both sources and lost the
+    per-source attribution, which led to false-positive failures
+    when container-startup chatter happened to match the
+    deliberately-broad ``pull-replication.*(error|failed|exception)``
+    rule.  Returning a structured report removes the guesswork:
+    every detection now carries the offending line, pattern, and
+    source, ready for ``logger`` output.
     """
+    report = ReplicationErrorReport()
+
     # --- 1. pull_replication_log (authoritative) ---
     if docker.exec_test(cid, "-f /var/gerrit/logs/pull_replication_log"):
         try:
-            # Build a grep pattern from the replication-specific patterns.
+            # We use grep -E (one OR'd alternation) for speed inside
+            # the container, then attribute each matched line back to
+            # the specific pattern in Python so the report carries
+            # accurate per-rule provenance.
             grep_pattern = "|".join(_REPLICATION_ERROR_PATTERNS)
             result = docker.exec_cmd(
                 cid,
@@ -307,21 +447,55 @@ def check_replication_errors(docker: DockerManager, cid: str) -> bool:
                 f"grep -iE '{grep_pattern}'",
                 check=False,
             )
-            if result.strip():
-                return True
+            for line in result.splitlines():
+                line = line.rstrip()
+                if not line:
+                    continue
+                matched_pattern = next(
+                    (
+                        p
+                        for p in _REPLICATION_ERROR_PATTERNS
+                        if re.search(p, line, re.IGNORECASE)
+                    ),
+                    "|".join(_REPLICATION_ERROR_PATTERNS),
+                )
+                report.log_file_matches.append(
+                    ErrorMatch(
+                        source="pull_replication_log",
+                        pattern=matched_pattern,
+                        line=line,
+                    )
+                )
         except DockerError:
             pass
 
     # --- 2. Container logs (narrow, replication-specific patterns only) ---
+    #
+    # Note: this path is intentionally treated as a *secondary*
+    # signal.  Some failure modes (plugin-load errors, JGit
+    # ``TransportException`` stack traces that never reach the
+    # per-event log) only ever appear here, so we cannot drop the
+    # source entirely.  But its patterns must remain narrow because
+    # the underlying stream carries everything Gerrit logs.  The
+    # caller (verify_single_instance / wait_for_replication) is
+    # responsible for deciding whether to fail or merely warn on
+    # these matches — see ``has_advisory_errors``.
     try:
         logs = docker.container_logs(cid, tail=2000)
         for pattern in _CONTAINER_ERROR_PATTERNS:
-            if re.search(pattern, logs, re.IGNORECASE):
-                return True
+            for line in logs.splitlines():
+                if re.search(pattern, line, re.IGNORECASE):
+                    report.container_log_matches.append(
+                        ErrorMatch(
+                            source="container_logs",
+                            pattern=pattern,
+                            line=line.rstrip(),
+                        )
+                    )
     except DockerError:
         pass
 
-    return False
+    return report
 
 
 def get_completed_repo_count(docker: DockerManager, cid: str) -> int:
@@ -887,7 +1061,14 @@ def wait_for_replication(
         elapsed += interval
 
         # ---- 1. Error check (require 2 consecutive hits) ----
-        if check_replication_errors(docker, cid):
+        error_report = check_replication_errors(docker, cid)
+        if error_report.has_any_errors:
+            # Always surface what matched so subsequent debug runs
+            # know which source and regex fired — the 50-line tail
+            # we dump on the failure branch below rarely contains
+            # the actual matching line for itself.
+            for diag in error_report.format_matches():
+                logger.warning(diag)
             consecutive_errors += 1
             if consecutive_errors >= 2:
                 logger.error("")
@@ -1186,31 +1367,20 @@ def verify_single_instance(
     # Step 3: Error check
     logger.info("")
     logger.info("Step 3: Checking for replication errors…")
-    if check_replication_errors(docker, cid):
-        result.error = "Replication errors detected"
+    error_report = check_replication_errors(docker, cid)
+    if error_report.has_any_errors:
+        # Always surface the matching lines first so the next
+        # diagnostic round can see exactly which source / pattern
+        # / line tripped the check, without relying on the bounded
+        # 50-line tail dumped below.
         logger.error("Replication errors detected! ❌")
+        for diag in error_report.format_matches():
+            logger.error(diag)
+        result.error = "Replication errors detected"
         log_tail = show_pull_replication_log(docker, cid)
         logger.error("  Pull replication log (recent):")
         for line in log_tail.splitlines():
             logger.error("    %s", line)
-
-        # Show only replication-specific error lines from container logs.
-        # Use the same narrow patterns as check_replication_errors() to
-        # avoid dumping unrelated Gerrit errors (email, account mgmt, etc.)
-        try:
-            container_logs = docker.container_logs(cid, tail=3000)
-            repl_error_pattern = "|".join(_CONTAINER_ERROR_PATTERNS)
-            error_lines = [
-                line
-                for line in container_logs.splitlines()
-                if re.search(repl_error_pattern, line, re.IGNORECASE)
-            ]
-            if error_lines:
-                logger.error("  Replication-related container log errors:")
-                for line in error_lines[-20:]:
-                    logger.error("    %s", line.strip())
-        except DockerError:
-            pass
         return result
 
     logger.info("  No replication errors detected ✅")

@@ -35,6 +35,31 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import make_completed_process
 from errors import DockerError, ReplicationError
+from replication import ErrorMatch, ReplicationErrorReport
+
+# Convenience helpers so the existing ``return_value=False/True`` mocks
+# read as the new structured report without sprinkling boilerplate at
+# every patch site.
+_NO_ERRORS = ReplicationErrorReport()
+
+
+def _authoritative_error_report() -> ReplicationErrorReport:
+    """Build a report that looks like a real per-event log hit.
+
+    Used in places where the original tests asserted a True return
+    from ``check_replication_errors``; mirrors that semantically as a
+    single pull_replication_log match.
+    """
+    return ReplicationErrorReport(
+        log_file_matches=[
+            ErrorMatch(
+                source="pull_replication_log",
+                pattern="TransportException",
+                line="TransportException: simulated by mock",
+            )
+        ]
+    )
+
 
 # =========================================================================
 # Dataclasses
@@ -448,7 +473,12 @@ class TestCheckReplicationErrors:
             ),
         ]
 
-        assert check_replication_errors(docker, "abc123") is False
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
+        assert report.has_authoritative_errors is False
+        assert report.has_advisory_errors is False
+        assert report.log_file_matches == []
+        assert report.container_log_matches == []
 
     def test_error_in_pull_replication_log(self, mock_docker):
         from replication import check_replication_errors
@@ -459,9 +489,19 @@ class TestCheckReplicationErrors:
             make_completed_process(returncode=0),
             # grep for errors: found
             make_completed_process(stdout="ERROR: Cannot replicate from origin"),
+            # container_logs: clean
+            make_completed_process(stdout="INFO: ready"),
         ]
 
-        assert check_replication_errors(docker, "abc123") is True
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is True
+        assert report.has_authoritative_errors is True
+        assert report.has_advisory_errors is False
+        assert len(report.log_file_matches) == 1
+        match = report.log_file_matches[0]
+        assert match.source == "pull_replication_log"
+        assert match.pattern == "Cannot replicate"
+        assert "Cannot replicate from origin" in match.line
 
     def test_transport_exception_in_log(self, mock_docker):
         from replication import check_replication_errors
@@ -472,9 +512,13 @@ class TestCheckReplicationErrors:
             make_completed_process(returncode=0),
             # grep: found TransportException
             make_completed_process(stdout="TransportException: Connection timed out"),
+            # container_logs: clean
+            make_completed_process(stdout="INFO: ready"),
         ]
 
-        assert check_replication_errors(docker, "abc123") is True
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_authoritative_errors is True
+        assert report.log_file_matches[0].pattern == "TransportException"
 
     def test_error_in_container_logs(self, mock_docker):
         from replication import check_replication_errors
@@ -490,7 +534,20 @@ class TestCheckReplicationErrors:
             ),
         ]
 
-        assert check_replication_errors(docker, "abc123") is True
+        report = check_replication_errors(docker, "abc123")
+        # Per-event log file was absent, so all hits are advisory.
+        assert report.has_authoritative_errors is False
+        assert report.has_advisory_errors is True
+        assert report.has_any_errors is True
+        # Both lines must be recorded, each with their attribution.
+        patterns = {m.pattern for m in report.container_log_matches}
+        # The "Cannot replicate" rule matches the first line; the
+        # "pull-replication.*(error|failed|exception)" rule matches
+        # the second line.
+        assert "Cannot replicate" in patterns
+        assert any("pull-replication" in p for p in patterns)
+        for m in report.container_log_matches:
+            assert m.source == "container_logs"
 
     def test_email_error_not_flagged_as_replication_error(self, mock_docker):
         """Email delivery failures must NOT be flagged as replication errors.
@@ -517,8 +574,9 @@ class TestCheckReplicationErrors:
             ),
         ]
 
-        # Must return False — email errors are not replication errors
-        assert check_replication_errors(docker, "abc123") is False
+        # Must report no errors — email errors are not replication errors
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
 
     def test_generic_permission_denied_not_flagged(self, mock_docker):
         """Generic 'Permission denied' in container logs should not trigger.
@@ -537,7 +595,8 @@ class TestCheckReplicationErrors:
             ),
         ]
 
-        assert check_replication_errors(docker, "abc123") is False
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
 
     def test_no_log_file_no_container_errors(self, mock_docker):
         from replication import check_replication_errors
@@ -550,7 +609,8 @@ class TestCheckReplicationErrors:
             make_completed_process(stdout="INFO: Gerrit Code Review 3.13.1 ready"),
         ]
 
-        assert check_replication_errors(docker, "abc123") is False
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
 
     def test_docker_error_treated_as_no_errors(self, mock_docker):
         from replication import check_replication_errors
@@ -565,8 +625,32 @@ class TestCheckReplicationErrors:
             DockerError("logs failed"),
         ]
 
-        # DockerError during log reading should not raise; should return False
-        assert check_replication_errors(docker, "abc123") is False
+        # DockerError during log reading should not raise; report is empty
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False
+
+    def test_format_matches_groups_by_source_and_pattern(self, mock_docker):
+        """format_matches() must surface source + pattern + line(s)."""
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: log file exists
+            make_completed_process(returncode=0),
+            # grep: one TransportException hit in the per-event log
+            make_completed_process(stdout="TransportException: fetch failed"),
+            # container_logs: also has a "Cannot replicate" line
+            make_completed_process(stdout="Cannot replicate from origin\n"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        lines = report.format_matches()
+        # Both sources must appear, each labelled with the regex.
+        joined = "\n".join(lines)
+        assert "pull_replication_log (authoritative)" in joined
+        assert "container_logs (advisory)" in joined
+        assert "TransportException" in joined
+        assert "Cannot replicate" in joined
 
 
 # =========================================================================
@@ -1100,7 +1184,7 @@ class TestWaitForReplication:
     @patch("replication.get_git_disk_usage_human", return_value="500M")
     @patch("replication.check_pull_replication_log", return_value=True)
     @patch("replication.check_replication_has_content", return_value=True)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories")
     @patch("replication.time.sleep")
@@ -1149,7 +1233,10 @@ class TestWaitForReplication:
 
     @patch("replication.show_pull_replication_log", return_value="error log")
     @patch("replication.list_repositories", return_value="/var/gerrit/git/a.git")
-    @patch("replication.check_replication_errors", return_value=True)
+    @patch(
+        "replication.check_replication_errors",
+        return_value=_authoritative_error_report(),
+    )
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories", return_value=5)
     @patch("replication.time.sleep")
@@ -1204,7 +1291,11 @@ class TestWaitForReplication:
 
         docker = MagicMock()
         # Error on first poll, then clears, then repo count matches
-        mock_errors.side_effect = [True, False, False]
+        mock_errors.side_effect = [
+            _authoritative_error_report(),
+            _NO_ERRORS,
+            _NO_ERRORS,
+        ]
         mock_snap.side_effect = [
             ReplicationSnapshot(
                 timestamp=100.0,
@@ -1244,7 +1335,7 @@ class TestWaitForReplication:
     @patch("replication.get_git_disk_usage_human", return_value="100M")
     @patch("replication.check_pull_replication_log", return_value=False)
     @patch("replication.check_replication_has_content", return_value=False)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories", return_value=2)
     @patch("replication.time.sleep")
@@ -1294,7 +1385,7 @@ class TestWaitForReplication:
     @patch("replication.get_git_disk_usage_human", return_value="200M")
     @patch("replication.check_pull_replication_log", return_value=True)
     @patch("replication.check_replication_has_content", return_value=True)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories")
     @patch("replication.time.sleep")
@@ -1334,7 +1425,7 @@ class TestWaitForReplication:
     @patch("replication.get_git_disk_usage_human", return_value="86M")
     @patch("replication.check_pull_replication_log", return_value=True)
     @patch("replication.check_replication_has_content", return_value=True)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories", return_value=36)
     @patch("replication.time.sleep")
@@ -1380,7 +1471,7 @@ class TestWaitForReplication:
     @patch("replication.get_git_disk_usage_human", return_value="86M")
     @patch("replication.check_pull_replication_log", return_value=False)
     @patch("replication.check_replication_has_content", return_value=False)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.take_snapshot")
     @patch("replication.count_repositories", return_value=36)
     @patch("replication.time.sleep")
@@ -1585,7 +1676,7 @@ class TestVerifySingleInstance:
     @patch("replication.get_completed_repo_count", return_value=10)
     @patch("replication.count_repositories", return_value=10)
     @patch("replication.wait_for_replication", return_value=True)
-    @patch("replication.check_replication_errors", return_value=False)
+    @patch("replication.check_replication_errors", return_value=_NO_ERRORS)
     @patch("replication.check_secure_config", return_value=True)
     @patch("replication.show_replication_config", return_value="[remote]")
     @patch("replication.check_replication_config", return_value=True)
@@ -1705,7 +1796,10 @@ class TestVerifySingleInstance:
     @patch("replication.show_replication_config", return_value="[remote]")
     @patch("replication.check_replication_config", return_value=True)
     @patch("replication.verify_plugin_loaded", return_value=True)
-    @patch("replication.check_replication_errors", return_value=True)
+    @patch(
+        "replication.check_replication_errors",
+        return_value=_authoritative_error_report(),
+    )
     def test_replication_errors_detected(
         self,
         mock_errors,
