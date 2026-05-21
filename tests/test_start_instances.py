@@ -1341,6 +1341,42 @@ class TestInitGerritSite:
                 "img:latest",
             )
 
+    def test_extra_init_args_raises_config_error_on_unbalanced_quote(
+        self, tmp_path: Path
+    ) -> None:
+        """Malformed ``gerrit_init_args`` produces an actionable ConfigError.
+
+        ``shlex.split`` raises ``ValueError`` on an unbalanced quote
+        (or other lexical malformation).  The previous implementation
+        let that propagate out as a bare ``ValueError`` from deep in
+        the container-start path, which surfaces in the workflow as a
+        Python stack trace with no hint that the cause was a bad
+        action input.  We now convert it to ``ConfigError`` (a
+        ``GerritActionError`` subclass) whose message names the input
+        and quotes the offending value so the user can fix it.
+        """
+        from errors import ConfigError
+
+        docker = MagicMock()
+        instance_dir = tmp_path / "instance"
+
+        with (
+            patch.object(start_instances, "_chown_tree"),
+            pytest.raises(ConfigError, match="Invalid 'gerrit_init_args'"),
+        ):
+            start_instances.init_gerrit_site(
+                docker,
+                instance_dir,
+                "test",
+                "http://localhost:18080/",
+                "img:latest",
+                # Unbalanced double quote — shlex.split raises ValueError.
+                extra_init_args='--config "unterminated',
+            )
+        # docker.run_ephemeral must NOT have been invoked: the error
+        # is raised before the command list is assembled.
+        docker.run_ephemeral.assert_not_called()
+
 
 # =====================================================================
 # configure_gerrit

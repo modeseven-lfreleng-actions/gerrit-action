@@ -36,6 +36,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import shlex
 import shutil
 import subprocess
 import sys
@@ -60,7 +61,7 @@ from config import (  # noqa: E402
     InstanceStore,
 )
 from docker_manager import DockerManager  # noqa: E402
-from errors import DockerError, GerritActionError  # noqa: E402
+from errors import ConfigError, DockerError, GerritActionError  # noqa: E402
 from logging_utils import log_group, setup_logging  # noqa: E402
 from outputs import write_summary  # noqa: E402
 
@@ -728,9 +729,20 @@ def init_gerrit_site(
             # correctly for values that contain spaces.  Each
             # token becomes its own argv element, matching the
             # behaviour ``gerrit init`` expects.
-            import shlex
-
-            for extra in shlex.split(extra_init_args):
+            #
+            # ``shlex.split`` raises ``ValueError`` on malformed
+            # input (e.g. an unbalanced quote).  Convert that to a
+            # ConfigError pointing at the offending action input so
+            # the user sees an actionable ``::error::`` line
+            # instead of an unhelpful stack trace from deep inside
+            # the container start path.
+            try:
+                extra_tokens = shlex.split(extra_init_args)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"Invalid 'gerrit_init_args' input ({exc}): {extra_init_args!r}"
+                ) from exc
+            for extra in extra_tokens:
                 if extra:
                     command.append(extra)
 
