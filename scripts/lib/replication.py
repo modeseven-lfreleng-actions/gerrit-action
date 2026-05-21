@@ -398,24 +398,75 @@ class ReplicationErrorReport:
     # caller can route to ``logger.warning`` / ``logger.error``.
     # ------------------------------------------------------------------
 
-    def format_matches(self, *, max_per_source: int = 20) -> list[str]:
-        """Return human-readable lines describing every match.
+    def format_matches(
+        self,
+        *,
+        max_per_source: int = 20,
+        sources: tuple[str, ...] | None = None,
+        magic_repo: bool | None = None,
+    ) -> list[str]:
+        """Return human-readable lines describing matches.
 
         Each block starts with a heading that identifies the source
         and pattern, followed by up to *max_per_source* matching
         lines indented for readability.  Returns an empty list when
-        there are no matches.
+        no matches remain after filtering.
+
+        Parameters
+        ----------
+        max_per_source:
+            Truncate each per-pattern block to this many lines.
+            Excess lines are summarised on a trailing
+            ``… N more line(s) truncated`` row.
+        sources:
+            Restrict the output to matches whose ``source`` is in
+            the given tuple (e.g. ``("pull_replication_log",)`` to
+            exclude the container-log advisory matches).  ``None``
+            (the default) includes every source.
+        magic_repo:
+            Restrict the output by magic-repo classification:
+            ``True`` keeps only magic-repo matches (those whose
+            ``is_magic_repo`` is True), ``False`` keeps only
+            non-magic (user-project) matches, and ``None`` (the
+            default) keeps both.
+
+        Callers print warnings under three separate headings
+        (advisory / magic-repo / user-project).  Use the filters
+        to scope each call site to the matches that belong under
+        its heading so the same line does not appear under more
+        than one heading.
         """
+        # Map source label → list of ``ErrorMatch`` objects, in the
+        # order the caller normally prints them.  Filtering keeps
+        # the ``ErrorMatch`` shape so we can inspect ``is_magic_repo``
+        # per match, rather than the previous string-only buckets.
+        source_buckets: tuple[tuple[str, str, list[ErrorMatch]], ...] = (
+            (
+                "pull_replication_log",
+                "pull_replication_log (authoritative)",
+                self.log_file_matches,
+            ),
+            (
+                "container_logs",
+                "container_logs (advisory)",
+                self.container_log_matches,
+            ),
+        )
+
         out: list[str] = []
-        for label, matches in (
-            ("pull_replication_log (authoritative)", self.log_file_matches),
-            ("container_logs (advisory)", self.container_log_matches),
-        ):
-            if not matches:
+        for source_key, label, matches in source_buckets:
+            if sources is not None and source_key not in sources:
+                continue
+            filtered = [
+                m
+                for m in matches
+                if magic_repo is None or m.is_magic_repo is magic_repo
+            ]
+            if not filtered:
                 continue
             # Group by pattern so callers can see which rule fired.
             by_pattern: dict[str, list[str]] = {}
-            for m in matches:
+            for m in filtered:
                 by_pattern.setdefault(m.pattern, []).append(m.line)
             for pattern, lines in by_pattern.items():
                 out.append(f"  {label} — pattern={pattern!r} — {len(lines)} match(es):")
@@ -1177,21 +1228,28 @@ def wait_for_replication(
         error_report = check_replication_errors(docker, cid)
         # Always surface what matched so subsequent debug runs know
         # which source / regex fired — the 50-line tail dumped on
-        # failure rarely contains the matching line itself.
+        # failure rarely contains the matching line itself.  Each
+        # heading is scoped to its own source / classification via
+        # format_matches() filters, so the same line never appears
+        # under more than one heading.
         if error_report.has_advisory_errors and debug:
             logger.debug("  Advisory replication signals (informational):")
-            for diag in error_report.format_matches():
+            for diag in error_report.format_matches(sources=("container_logs",)):
                 logger.debug(diag)
         if error_report.has_magic_repo_errors:
             logger.warning(
                 "  Magic-repo replication errors (degraded NoteDb "
                 "rendering; user-project replication unaffected):"
             )
-            for diag in error_report.format_matches():
+            for diag in error_report.format_matches(
+                sources=("pull_replication_log",), magic_repo=True
+            ):
                 logger.warning(diag)
         if error_report.has_user_project_errors:
             logger.warning("  Authoritative replication-log errors:")
-            for diag in error_report.format_matches():
+            for diag in error_report.format_matches(
+                sources=("pull_replication_log",), magic_repo=False
+            ):
                 logger.warning(diag)
             consecutive_errors += 1
             if consecutive_errors >= 2:
@@ -1504,7 +1562,7 @@ def verify_single_instance(
             "  Advisory replication signals in container logs "
             "(informational, will not fail verification):"
         )
-        for diag in error_report.format_matches():
+        for diag in error_report.format_matches(sources=("container_logs",)):
             logger.warning(diag)
     if error_report.has_magic_repo_errors:
         logger.warning(
@@ -1512,11 +1570,15 @@ def verify_single_instance(
             "rendering; user-project replication unaffected, "
             "will not fail verification):"
         )
-        for diag in error_report.format_matches():
+        for diag in error_report.format_matches(
+            sources=("pull_replication_log",), magic_repo=True
+        ):
             logger.warning(diag)
     if error_report.has_user_project_errors:
         logger.error("Replication errors detected in pull_replication_log! ❌")
-        for diag in error_report.format_matches():
+        for diag in error_report.format_matches(
+            sources=("pull_replication_log",), magic_repo=False
+        ):
             logger.error(diag)
         result.error = "Replication errors detected"
         # Dump the full 500-line tail — same window the scan uses,

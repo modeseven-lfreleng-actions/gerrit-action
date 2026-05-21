@@ -129,9 +129,13 @@ def _flush_caches(client: GerritDevClient, slug: str) -> int:
     for cache_name in _CACHES_TO_FLUSH:
         endpoint = f"config/server/caches/{cache_name}/flush"
         try:
-            # The flush endpoint takes no body.  ``GerritDevClient.post``
-            # handles XSRF token + cookie auth automatically.
-            client.post(endpoint, data="")
+            # The flush endpoint takes no body.  Pass ``data=None``
+            # (not ``data=""``) so the client sends a true zero-byte
+            # request: an empty string with ``Content-Type:
+            # application/json`` makes Gerrit attempt to parse it as
+            # a JSON document and reject the request with
+            # ``HTTP 400: Expected JSON object``.
+            client.post(endpoint, data=None)
             flushed += 1
             logger.debug("[%s]   flushed cache: %s", slug, cache_name)
         except GerritAPIError as exc:
@@ -187,7 +191,14 @@ def _reindex_project(client: GerritDevClient, slug: str, project: str) -> bool:
     encoded = quote(project, safe="")
     endpoint = f"projects/{encoded}/index.changes"
     try:
-        client.post(endpoint, data="")
+        # The index.changes endpoint takes no body.  Pass
+        # ``data=None`` so the client sends a zero-byte request;
+        # ``data=""`` would set the body to an empty string which,
+        # combined with ``Content-Type: application/json``, makes
+        # Gerrit reject the call with ``HTTP 400: Expected JSON
+        # object`` (observed on every project of the previous
+        # dispatch).
+        client.post(endpoint, data=None)
     except GerritAPIError as exc:
         # Projects with no changes return 204 No Content which the
         # client treats as success; an actual error here is genuinely
@@ -278,9 +289,21 @@ def reindex_instance(
 def run() -> int:
     """Reindex every instance listed in ``$WORK_DIR/instances.json``.
 
-    Returns 0 on success (always; per-project failures are
-    informational).  Returns 1 if the run is misconfigured (missing
-    instances file, etc.).
+    Per-project reindex failures are logged but never propagate to
+    the exit code: the action's overall verify-replication step is
+    the authoritative pass/fail gate, and a partially reindexed
+    Gerrit is more useful than a workflow that aborts on the first
+    HTTP hiccup.  Missing or empty ``instances.json``, disabled
+    ``REINDEX_AFTER_SYNC``, and disabled ``SYNC_ON_STARTUP`` are
+    all treated as no-op success cases.
+
+    Returns
+    -------
+    int
+        Always ``0`` under normal operation.  Unhandled exceptions
+        (caught by :func:`main`) map to ``1`` via
+        ``GerritActionError`` or ``2`` via the generic exception
+        handler; ``run`` itself does not return a non-zero code.
     """
     config = ActionConfig.from_environment()
     setup_logging(debug=config.debug)

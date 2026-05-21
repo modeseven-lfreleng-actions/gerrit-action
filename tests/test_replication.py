@@ -652,6 +652,96 @@ class TestCheckReplicationErrors:
         assert "TransportException" in joined
         assert "Cannot replicate" in joined
 
+    def test_format_matches_filters_by_source(self):
+        """``sources=`` keyword restricts output to the named source(s).
+
+        Callers print three separate headings (advisory /
+        magic-repo / user-project) and rely on filtering to keep
+        the same line from appearing under more than one heading.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="TransportException",
+                    line="TransportException: /aai/resources.git: 500",
+                )
+            ],
+            container_log_matches=[
+                ErrorMatch(
+                    source="container_logs",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from origin",
+                )
+            ],
+        )
+
+        # Per-event-log only — container_log heading must be absent.
+        log_only = "\n".join(report.format_matches(sources=("pull_replication_log",)))
+        assert "pull_replication_log (authoritative)" in log_only
+        assert "container_logs (advisory)" not in log_only
+        assert "TransportException" in log_only
+        assert "Cannot replicate" not in log_only
+
+        # Container-log only — the reverse.
+        ctr_only = "\n".join(report.format_matches(sources=("container_logs",)))
+        assert "container_logs (advisory)" in ctr_only
+        assert "pull_replication_log (authoritative)" not in ctr_only
+        assert "Cannot replicate" in ctr_only
+        assert "TransportException" not in ctr_only
+
+    def test_format_matches_filters_by_magic_repo_flag(self):
+        """``magic_repo=True/False`` restricts output by the magic-repo flag.
+
+        Lets the magic-repo and user-project headings each render
+        only their own ``ErrorMatch`` entries from the per-event log,
+        which would otherwise both be returned together.
+        """
+        from replication import ErrorMatch, ReplicationErrorReport
+
+        report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from /All-Users.git",
+                    is_magic_repo=True,
+                ),
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from /aai/resources.git",
+                    is_magic_repo=False,
+                ),
+            ]
+        )
+
+        magic_only = "\n".join(report.format_matches(magic_repo=True))
+        assert "All-Users.git" in magic_only
+        assert "aai/resources.git" not in magic_only
+
+        user_only = "\n".join(report.format_matches(magic_repo=False))
+        assert "aai/resources.git" in user_only
+        assert "All-Users.git" not in user_only
+
+        # Combined source+magic filter (the wait_for_replication
+        # call shape) must not leak the container_log advisory.
+        report.container_log_matches.append(
+            ErrorMatch(
+                source="container_logs",
+                pattern="pull-replication",
+                line="unrelated advisory",
+            )
+        )
+        scoped = "\n".join(
+            report.format_matches(sources=("pull_replication_log",), magic_repo=False)
+        )
+        assert "aai/resources.git" in scoped
+        assert "All-Users.git" not in scoped
+        assert "unrelated advisory" not in scoped
+
     def test_plugin_loader_lifecycle_not_flagged(self, mock_docker):
         """Bare plugin-loader / lifecycle mentions must not trip the check.
 
