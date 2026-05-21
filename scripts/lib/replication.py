@@ -1186,6 +1186,15 @@ def wait_for_replication(
     interval = 5
     consecutive_errors = 0  # require 2 in a row before failing fast
     initial_count = count_repositories(docker, cid)
+    # Track the set of already-warned diagnostic lines per source so we
+    # only log each unique advisory / magic-repo / user-project match
+    # once across the poll loop.  Without this guard the same
+    # ``Cannot replicate from ... All-Users.git`` line is re-emitted
+    # on every interval (≈12x per minute), drowning the legitimate
+    # progress lines and the final summary.
+    seen_advisory: set[str] = set()
+    seen_magic_repo: set[str] = set()
+    seen_user_project: set[str] = set()
 
     logger.info("  Initial repository count: %d", initial_count)
     if project:
@@ -1231,26 +1240,51 @@ def wait_for_replication(
         # failure rarely contains the matching line itself.  Each
         # heading is scoped to its own source / classification via
         # format_matches() filters, so the same line never appears
-        # under more than one heading.
+        # under more than one heading.  We deduplicate against the
+        # per-loop ``seen_*`` sets so each unique match is logged
+        # exactly once, even though the underlying scan re-runs on
+        # every interval and the same magic-repo failure line tends
+        # to persist for the whole poll session.
         if error_report.has_advisory_errors and debug:
-            logger.debug("  Advisory replication signals (informational):")
-            for diag in error_report.format_matches(sources=("container_logs",)):
-                logger.debug(diag)
+            new_lines = [
+                m.line
+                for m in error_report.container_log_matches
+                if m.line not in seen_advisory
+            ]
+            if new_lines:
+                logger.debug("  Advisory replication signals (informational):")
+                for diag in error_report.format_matches(sources=("container_logs",)):
+                    logger.debug(diag)
+                seen_advisory.update(new_lines)
         if error_report.has_magic_repo_errors:
-            logger.warning(
-                "  Magic-repo replication errors (degraded NoteDb "
-                "rendering; user-project replication unaffected):"
-            )
-            for diag in error_report.format_matches(
-                sources=("pull_replication_log",), magic_repo=True
-            ):
-                logger.warning(diag)
+            new_lines = [
+                m.line
+                for m in error_report.log_file_matches
+                if m.is_magic_repo and m.line not in seen_magic_repo
+            ]
+            if new_lines:
+                logger.warning(
+                    "  Magic-repo replication errors (degraded NoteDb "
+                    "rendering; user-project replication unaffected):"
+                )
+                for diag in error_report.format_matches(
+                    sources=("pull_replication_log",), magic_repo=True
+                ):
+                    logger.warning(diag)
+                seen_magic_repo.update(new_lines)
         if error_report.has_user_project_errors:
-            logger.warning("  Authoritative replication-log errors:")
-            for diag in error_report.format_matches(
-                sources=("pull_replication_log",), magic_repo=False
-            ):
-                logger.warning(diag)
+            new_lines = [
+                m.line
+                for m in error_report.log_file_matches
+                if not m.is_magic_repo and m.line not in seen_user_project
+            ]
+            if new_lines:
+                logger.warning("  Authoritative replication-log errors:")
+                for diag in error_report.format_matches(
+                    sources=("pull_replication_log",), magic_repo=False
+                ):
+                    logger.warning(diag)
+                seen_user_project.update(new_lines)
             consecutive_errors += 1
             if consecutive_errors >= 2:
                 logger.error("")

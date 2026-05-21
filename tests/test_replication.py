@@ -1592,6 +1592,86 @@ class TestWaitForReplication:
         )
         assert result is True
 
+    @patch("replication.check_replication_errors")
+    @patch("replication.check_pull_replication_log", return_value=True)
+    @patch("replication.check_replication_has_content", return_value=True)
+    @patch("replication.take_snapshot")
+    @patch("replication.count_repositories", return_value=10)
+    @patch("replication.time.sleep")
+    def test_persistent_magic_repo_error_logged_once(
+        self,
+        mock_sleep,
+        mock_count,
+        mock_snap,
+        mock_has_content,
+        mock_log_ok,
+        mock_errors,
+        caplog,
+    ):
+        """The same magic-repo failure line is logged once per wait loop.
+
+        ``check_replication_errors`` is re-run on every interval
+        (≈5s) and a persistent All-Users permission denial returns
+        the same matching line every time.  Without dedup the wait
+        loop would emit the warning block ≈12 times per minute,
+        burying real progress lines.  The ``seen_magic_repo`` set
+        guarantees we log each unique line exactly once.
+        """
+        from replication import (
+            ErrorMatch,
+            ReplicationErrorReport,
+            ReplicationSnapshot,
+            wait_for_replication,
+        )
+
+        magic_report = ReplicationErrorReport(
+            log_file_matches=[
+                ErrorMatch(
+                    source="pull_replication_log",
+                    pattern="Cannot replicate",
+                    line="Cannot replicate from /All-Users.git",
+                    is_magic_repo=True,
+                )
+            ]
+        )
+        # Same persistent magic-repo error on every poll until
+        # completion.
+        mock_errors.side_effect = [magic_report, magic_report, magic_report]
+        mock_snap.side_effect = [
+            ReplicationSnapshot(
+                timestamp=t,
+                completed_count=10,
+                disk_usage_kb=500000,
+                log_line_count=100,
+                repo_count=10,
+            )
+            for t in (100.0, 105.0, 110.0)
+        ]
+
+        docker = MagicMock()
+        with caplog.at_level("WARNING"):
+            result = wait_for_replication(
+                docker,
+                "abc123",
+                "onap",
+                timeout=30,
+                expected_count=10,
+                stability_window=60,
+            )
+        assert result is True
+        # The magic-repo warning heading appears exactly once,
+        # even though check_replication_errors returned the same
+        # match three times.
+        magic_headings = [
+            rec
+            for rec in caplog.records
+            if "Magic-repo replication errors" in rec.getMessage()
+        ]
+        assert len(magic_headings) == 1, (
+            f"expected one magic-repo warning, got {len(magic_headings)}: "
+            f"{[r.getMessage() for r in magic_headings]}"
+        )
+
     @patch("replication.show_pull_replication_log", return_value="log tail")
     @patch("replication.list_repositories", return_value="repos")
     @patch("replication.get_git_disk_usage_human", return_value="100M")

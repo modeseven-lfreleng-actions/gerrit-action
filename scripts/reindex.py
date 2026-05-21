@@ -130,12 +130,13 @@ def _flush_caches(client: GerritDevClient, slug: str) -> int:
         endpoint = f"config/server/caches/{cache_name}/flush"
         try:
             # The flush endpoint takes no body.  Pass ``data=None``
-            # (not ``data=""``) so the client sends a true zero-byte
-            # request: an empty string with ``Content-Type:
-            # application/json`` makes Gerrit attempt to parse it as
-            # a JSON document and reject the request with
-            # ``HTTP 400: Expected JSON object``.
-            client.post(endpoint, data=None)
+            # so the client sends a true zero-byte request, and
+            # ``content_type=""`` to suppress the default
+            # ``Content-Type: application/json`` header — otherwise
+            # Gerrit sees ``Content-Type: application/json`` with an
+            # empty body, tries to parse ``""`` as JSON, and rejects
+            # the call with ``HTTP 400: Expected JSON object``.
+            client.post(endpoint, data=None, content_type="")
             flushed += 1
             logger.debug("[%s]   flushed cache: %s", slug, cache_name)
         except GerritAPIError as exc:
@@ -192,13 +193,15 @@ def _reindex_project(client: GerritDevClient, slug: str, project: str) -> bool:
     endpoint = f"projects/{encoded}/index.changes"
     try:
         # The index.changes endpoint takes no body.  Pass
-        # ``data=None`` so the client sends a zero-byte request;
-        # ``data=""`` would set the body to an empty string which,
-        # combined with ``Content-Type: application/json``, makes
-        # Gerrit reject the call with ``HTTP 400: Expected JSON
-        # object`` (observed on every project of the previous
-        # dispatch).
-        client.post(endpoint, data=None)
+        # ``data=None`` so the client sends a zero-byte request,
+        # and ``content_type=""`` so the default
+        # ``Content-Type: application/json`` header is suppressed:
+        # if it is sent alongside an empty body Gerrit tries to
+        # parse ``""`` as JSON and rejects with
+        # ``HTTP 400: Expected JSON object`` (observed against
+        # every project of the previous two dispatches even with
+        # ``data=None`` alone).
+        client.post(endpoint, data=None, content_type="")
     except GerritAPIError as exc:
         # Projects with no changes return 204 No Content which the
         # client treats as success; an actual error here is genuinely
