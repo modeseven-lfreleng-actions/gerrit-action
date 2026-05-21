@@ -667,8 +667,12 @@ def init_gerrit_site(
     Parameters
     ----------
     extra_init_args:
-        Optional comma-separated list of additional arguments to pass
-        to ``gerrit init`` (from the ``gerrit_init_args`` action input).
+        Optional shell-style argument string to pass to ``gerrit init``
+        (from the ``gerrit_init_args`` action input).  Parsed with
+        ``shlex.split`` so callers can use the familiar
+        whitespace-separated form (``--foo bar --baz=qux``) and quote
+        values that contain spaces.  Each resulting token becomes its
+        own argv element.  Empty strings are ignored.
     """
     logger.info("Initializing Gerrit site for %s…", slug)
 

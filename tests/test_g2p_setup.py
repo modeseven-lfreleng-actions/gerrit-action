@@ -721,14 +721,23 @@ class TestSetupG2pHooks:
         exec_calls = [c[0][1] for c in docker.exec_cmd.call_args_list]
         assert any(f"mkdir -p {GERRIT_HOOKS_DIR}" in c for c in exec_calls)
 
-    def test_wrapper_target_points_to_venv_bin(self) -> None:
-        """The installed wrapper script references the venv binary.
+    def test_wrapper_installed_at_hook_path(self) -> None:
+        """The wrapper script is copied to the expected hook path.
 
         We replaced the previous bare ``ln -sf`` symlink with a thin
         POSIX-shell wrapper so every Gerrit hook invocation is teed
-        to ``/var/gerrit/logs/g2p-hooks.log``.  Confirm the wrapper
-        body still names the underlying console script so Gerrit
-        ends up running the same target as before.
+        to ``/var/gerrit/logs/g2p-hooks.log``.  This test asserts the
+        destination side of the install: ``docker.cp`` is invoked
+        with the canonical ``<cid>:<GERRIT_HOOKS_DIR>/<hook>`` path,
+        which is the location Gerrit's hooks plugin loads from.
+
+        We do not inspect the wrapper *body* here because
+        ``_write_file_in_container`` deletes the temp source file as
+        soon as ``docker.cp`` returns, so the file content is no
+        longer reachable from the mock's call args.  The wrapper's
+        ``TARGET=`` line is exercised by the in-container
+        ``selftest_g2p_plumbing`` checks once the container is
+        running.
         """
         docker = _make_docker_mock(exec_test_return=True)
         config = G2PConfig(
@@ -737,10 +746,8 @@ class TestSetupG2pHooks:
             hooks=["patchset-created"],
         )
         setup_g2p_hooks(docker, CID, config)
-        # The wrapper is written via DockerManager.cp; pull the
-        # written content out of the call args and confirm the
-        # console-script path appears as the TARGET shell variable
-        # the wrapper exec()s.
+        # Assert the destination passed to docker.cp is the
+        # canonical hook path inside the container.
         assert docker.cp.called, "expected docker.cp() call to install wrapper"
         cp_calls = docker.cp.call_args_list
         wrapper_paths = [c[0][1] for c in cp_calls]
