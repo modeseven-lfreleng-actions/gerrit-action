@@ -84,11 +84,32 @@ _REPLICATION_ERROR_PATTERNS = [
 # or "Permission denied" cause false positives when e.g. the email
 # subsystem cannot reach an SMTP server.
 #
+# All patterns require a replication verb (``fetch``, ``replicat``,
+# ``remote``) *and* an error verb (``error``, ``failed``,
+# ``exception``).  Mentioning the plugin name alone is not enough:
+# ``Loaded plugin pull-replication, version v3.5.6`` and similar
+# lifecycle lines never imply a fault, and the previous
+# ``pull-replication.*(?:error|failed|exception)`` rule trip-fired
+# whenever a plugin-loader / JVM-init message containing one of
+# those bare words landed on the same line as the plugin name.
+#
 # Only patterns that unambiguously indicate a replication failure belong
 # here.
 _CONTAINER_ERROR_PATTERNS = [
     "Cannot replicate",
-    r"pull-replication.*(?:error|failed|exception)",
+    # Plugin name + replication verb + error verb, in any order on the
+    # same line.  The triple-anchor requirement keeps generic startup /
+    # plugin-loader lines out of the false-positive surface.
+    (
+        r"pull-replication.*"
+        r"(?:fetch|replicat|remote).*"
+        r"(?:error|failed|exception)"
+    ),
+    (
+        r"pull-replication.*"
+        r"(?:error|failed|exception).*"
+        r"(?:fetch|replicat|remote)"
+    ),
     r"TransportException.*(?:fetch|replicate|remote)",
     "git-upload-pack not permitted",
 ]
@@ -1061,12 +1082,24 @@ def wait_for_replication(
         elapsed += interval
 
         # ---- 1. Error check (require 2 consecutive hits) ----
+        #
+        # Authoritative matches (per-event pull_replication_log) gate
+        # the consecutive-hit counter that can ultimately fail the
+        # workflow.  Advisory matches (container ``docker logs``) are
+        # surfaced as warnings but do NOT count toward the failure
+        # threshold — their patterns are heuristic and the source
+        # stream is too broad (everything Gerrit writes to
+        # stdout/stderr) to fail a deployment on its own.
         error_report = check_replication_errors(docker, cid)
-        if error_report.has_any_errors:
-            # Always surface what matched so subsequent debug runs
-            # know which source and regex fired — the 50-line tail
-            # we dump on the failure branch below rarely contains
-            # the actual matching line for itself.
+        # Always surface what matched so subsequent debug runs know
+        # which source / regex fired — the 50-line tail dumped on
+        # failure rarely contains the matching line itself.
+        if error_report.has_advisory_errors and debug:
+            logger.debug("  Advisory replication signals (informational):")
+            for diag in error_report.format_matches():
+                logger.debug(diag)
+        if error_report.has_authoritative_errors:
+            logger.warning("  Authoritative replication-log errors:")
             for diag in error_report.format_matches():
                 logger.warning(diag)
             consecutive_errors += 1
@@ -1365,20 +1398,35 @@ def verify_single_instance(
     check_secure_config(docker, cid)
 
     # Step 3: Error check
+    #
+    # Only authoritative matches (per-event pull_replication_log)
+    # fail the verification.  Advisory matches (container
+    # ``docker logs``) are emitted as warnings so operators can
+    # see them in the workflow output without having the action
+    # bail on startup chatter that happened to match a heuristic
+    # pattern.  This mirrors ``wait_for_replication``'s treatment
+    # of the two sources.
     logger.info("")
     logger.info("Step 3: Checking for replication errors…")
     error_report = check_replication_errors(docker, cid)
-    if error_report.has_any_errors:
-        # Always surface the matching lines first so the next
-        # diagnostic round can see exactly which source / pattern
-        # / line tripped the check, without relying on the bounded
-        # 50-line tail dumped below.
-        logger.error("Replication errors detected! ❌")
+    if error_report.has_advisory_errors:
+        logger.warning(
+            "  Advisory replication signals in container logs "
+            "(informational, will not fail verification):"
+        )
+        for diag in error_report.format_matches():
+            logger.warning(diag)
+    if error_report.has_authoritative_errors:
+        logger.error("Replication errors detected in pull_replication_log! ❌")
         for diag in error_report.format_matches():
             logger.error(diag)
         result.error = "Replication errors detected"
-        log_tail = show_pull_replication_log(docker, cid)
-        logger.error("  Pull replication log (recent):")
+        # Dump the full 500-line tail — same window the scan uses,
+        # so the matching line is guaranteed to be in the dump even
+        # if the operator scrolls back from the format_matches
+        # output to the surrounding context.
+        log_tail = show_pull_replication_log(docker, cid, lines=500)
+        logger.error("  Pull replication log (last 500 lines):")
         for line in log_tail.splitlines():
             logger.error("    %s", line)
         return result

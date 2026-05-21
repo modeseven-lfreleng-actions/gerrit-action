@@ -652,6 +652,72 @@ class TestCheckReplicationErrors:
         assert "TransportException" in joined
         assert "Cannot replicate" in joined
 
+    def test_plugin_loader_lifecycle_not_flagged(self, mock_docker):
+        """Bare plugin-loader / lifecycle mentions must not trip the check.
+
+        Until the container pattern was tightened to require both a
+        replication verb (``fetch`` / ``replicat`` / ``remote``) AND
+        an error verb (``error`` / ``failed`` / ``exception``) on the
+        same line, a benign startup line such as
+        ``Loaded plugin pull-replication, version v3.5.6`` could be
+        followed (anywhere on later lines) by an unrelated
+        ``ExceptionInInitializerError`` from another subsystem and
+        the broad rule would falsely fire.  These container-log
+        lines must now be silently ignored.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: log file does NOT exist
+            make_completed_process(returncode=1),
+            # container_logs: plugin-loader chatter + an unrelated
+            # "exception" word that previously made the broad rule fire.
+            make_completed_process(
+                stdout=(
+                    "[2026-05-21T13:45:33.383Z] [main] INFO  "
+                    "com.google.gerrit.server.plugins.PluginLoader : "
+                    "Loaded plugin pull-replication, version v3.5.6\n"
+                    "[2026-05-21T13:45:33.500Z] [main] INFO  "
+                    "com.google.gerrit.server.email.SmtpEmailSender : "
+                    "SMTP connection refused; an exception was logged\n"
+                )
+            ),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_any_errors is False, (
+            f"unexpected matches: {report.format_matches()}"
+        )
+
+    def test_real_fetch_failure_still_flagged(self, mock_docker):
+        """A genuine pull-replication fetch failure must still match.
+
+        The tightened triple-anchor rule (plugin name + replication
+        verb + error verb) must continue to catch the only failure
+        modes the container-log scan exists for.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            # exec_test: log file does NOT exist
+            make_completed_process(returncode=1),
+            # container_logs: a real failure — plugin name + fetch + failed.
+            make_completed_process(
+                stdout=(
+                    "[2026-05-21T13:45:40.000Z] [pull-replication-1] ERROR "
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch.X : "
+                    "pull-replication fetch failed for remote onap-meta: "
+                    "java.io.IOException: 403 Forbidden\n"
+                )
+            ),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        assert report.has_advisory_errors is True
+        assert report.has_authoritative_errors is False
+
 
 # =========================================================================
 # get_completed_repo_count
@@ -1831,6 +1897,73 @@ class TestVerifySingleInstance:
         result = verify_single_instance(docker, "onap", instance)
         assert result.success is False
         assert "error" in result.error.lower()
+
+    @patch("replication.get_git_disk_usage_mb", return_value=500)
+    @patch("replication.get_git_disk_usage_human", return_value="500M")
+    @patch("replication.get_completed_repo_count", return_value=10)
+    @patch("replication.count_repositories", return_value=10)
+    @patch("replication.wait_for_replication", return_value=True)
+    @patch("replication.check_secure_config", return_value=True)
+    @patch("replication.show_replication_config", return_value="[remote]")
+    @patch("replication.check_replication_config", return_value=True)
+    @patch("replication.verify_plugin_loaded", return_value=True)
+    @patch(
+        "replication.check_replication_errors",
+        return_value=ReplicationErrorReport(
+            container_log_matches=[
+                ErrorMatch(
+                    source="container_logs",
+                    pattern="pull-replication.*(fetch|replicat|remote).*"
+                    "(error|failed|exception)",
+                    line="pull-replication fetch failed for remote onap-meta",
+                )
+            ]
+        ),
+    )
+    def test_advisory_only_errors_do_not_fail_verification(
+        self,
+        mock_errors,
+        mock_plugin,
+        mock_config,
+        mock_show_config,
+        mock_secure,
+        mock_wait,
+        mock_count,
+        mock_completed,
+        mock_disk_human,
+        mock_disk_mb,
+    ):
+        """Container-log-only matches must warn but not fail.
+
+        Step 3 of ``verify_single_instance`` previously fused the two
+        sources via the old boolean return.  A single hit on the
+        broad ``pull-replication.*(error|failed|exception)`` rule —
+        which trip-fired against benign Gerrit startup chatter —
+        was enough to abort the whole workflow.  The structured
+        report now gates failure on ``has_authoritative_errors``
+        only; advisory matches are surfaced as warnings so the
+        operator can see them, and verification continues.
+        """
+        from replication import verify_single_instance
+
+        docker = MagicMock()
+        docker.container_exists.return_value = True
+        docker.container_state.return_value = "running"
+        docker.exec_test.return_value = True
+
+        instance = {
+            "cid": "abc123def456",
+            "gerrit_host": "gerrit.example.org",
+            "project": "",
+            "expected_project_count": 10,
+        }
+
+        result = verify_single_instance(docker, "onap", instance)
+        # Advisory-only matches must not abort verification — the
+        # later steps (wait_for_replication / disk usage) decide
+        # success.
+        assert result.success is True
+        assert result.error == ""
 
     def test_docker_error_during_container_check(self):
         from replication import verify_single_instance
