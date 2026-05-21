@@ -651,9 +651,14 @@ _ts() {{
 start_ts=$(_ts)
 pid=$$
 
-# Header: timestamp, hook, pid, full argv.  Argv is rendered with
-# %q-style single-quote escaping by 'set' so embedded spaces and
-# special characters survive the round-trip into the log file.
+# Header: timestamp, hook, pid, full argv.  Each argv element is
+# wrapped in single quotes with any embedded single quotes
+# replaced by the standard POSIX-shell quoting sequence
+# ``'\''`` (close, escaped quote, reopen) via two sed substitutions.
+# This is functionally equivalent to printf %q without depending
+# on bash, so embedded spaces and special characters survive the
+# round-trip into the log file in a form a human reader can
+# unambiguously re-tokenise.
 {{
     printf '%s [g2p-hook][%s] start pid=%s argv:' "$start_ts" "$HOOK_NAME" "$pid"
     for a in "$@"; do
@@ -1202,22 +1207,53 @@ def selftest_g2p_plumbing(
         )
     )
 
-    # 3 & 4. hook wrappers exist and their targets are executable.
-    # The check name (``hook_symlink_*``) is kept stable for any
-    # downstream consumers that filter on it.  ``readlink -f`` works
-    # for both symlinks and regular files — it returns the
-    # canonical path either way — so the same logic verifies the
-    # new wrapper-script layout without code change.
+    # 3 & 4. Hook wrappers exist and their underlying TARGET
+    # console script (the line ``TARGET='/opt/gerrit-tools/bin/<hook>'``
+    # inside the wrapper) is executable.  The check name
+    # (``hook_symlink_*``) is kept stable for any downstream
+    # consumers that filter on it, even though the install layer
+    # has moved from a bare ``ln -sf`` symlink to a POSIX-shell
+    # wrapper.  We deliberately do NOT use ``readlink -f`` here:
+    # on a regular wrapper file ``readlink -f`` resolves to the
+    # wrapper itself, which would validate nothing about the
+    # underlying console script the wrapper exec()s.  Instead we
+    # parse the wrapper's ``TARGET=`` line so the check actually
+    # asserts what it claims to.
     for hook_name in config.hooks:
         hook_path = f"{GERRIT_HOOKS_DIR}/{hook_name}"
-        target = _exec_or_blank(docker, cid, f"readlink -f {hook_path}")
+
+        # The wrapper itself must exist and be executable.
+        if not docker.exec_test(cid, f"-f {hook_path}"):
+            report.checks.append(
+                _selftest_check(
+                    f"hook_symlink_{hook_name}",
+                    passed=False,
+                    severity="error",
+                    message=f"{hook_path} missing",
+                )
+            )
+            continue
+
+        # Extract the TARGET shell variable from the wrapper body.
+        # The wrapper installs a single ``TARGET='...'`` line; we
+        # grep + sed it out rather than executing the wrapper.
+        target = _exec_or_blank(
+            docker,
+            cid,
+            (
+                f'grep -m1 "^TARGET=" {hook_path} | '
+                'sed -E "s/^TARGET=[\'\\"]?//; s/[\'\\"]?$//"'
+            ),
+        )
         if not target:
             report.checks.append(
                 _selftest_check(
                     f"hook_symlink_{hook_name}",
                     passed=False,
                     severity="error",
-                    message=(f"{hook_path} does not resolve to a target"),
+                    message=(
+                        f"{hook_path} has no TARGET= line; wrapper looks malformed"
+                    ),
                 )
             )
             continue
@@ -1231,8 +1267,9 @@ def selftest_g2p_plumbing(
             )
         )
 
-        # Executable as the gerrit user (UID 1000, the runtime user
-        # Gerrit uses to fork hook processes).
+        # The underlying console script must be present and runnable
+        # as the gerrit user (UID 1000, the runtime user Gerrit uses
+        # to fork hook processes).
         is_exec = docker.exec_test(cid, f"-x {target}") and docker.exec_test(
             cid, f"-r {target}"
         )
