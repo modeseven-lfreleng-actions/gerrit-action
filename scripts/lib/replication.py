@@ -526,6 +526,7 @@ class ReplicationErrorReport:
         sources: tuple[str, ...] | None = None,
         magic_repo: bool | None = None,
         soft_failure: bool | None = None,
+        only_lines: set[str] | None = None,
     ) -> list[str]:
         """Return human-readable lines describing matches.
 
@@ -557,6 +558,17 @@ class ReplicationErrorReport:
             ``InexistentRefTransportException``), ``False`` keeps
             only non-soft (real) failures, and ``None`` (the
             default) keeps both.
+        only_lines:
+            Restrict the output to matches whose ``line`` text is
+            in the given set.  ``None`` (the default) keeps every
+            match.  Used by the wait-loop callers to pass a set of
+            "newly-discovered" lines so the heading they print only
+            contains those lines and not every match accumulated
+            across the whole report — the per-loop dedup sets
+            (``seen_advisory`` / ``seen_soft_failure`` /
+            ``seen_magic_repo`` / ``seen_user_project``) gate the
+            heading itself, and ``only_lines`` here scopes the body
+            so each unique match is logged exactly once.
 
         Callers print warnings under four separate headings
         (advisory / soft-failure / magic-repo / user-project) and
@@ -589,6 +601,7 @@ class ReplicationErrorReport:
                 for m in matches
                 if (magic_repo is None or m.is_magic_repo is magic_repo)
                 and (soft_failure is None or m.is_soft_failure is soft_failure)
+                and (only_lines is None or m.line in only_lines)
             ]
             if not filtered:
                 continue
@@ -1427,7 +1440,10 @@ def wait_for_replication(
             ]
             if new_lines:
                 logger.debug("  Advisory replication signals (informational):")
-                for diag in error_report.format_matches(sources=("container_logs",)):
+                new_set = set(new_lines)
+                for diag in error_report.format_matches(
+                    sources=("container_logs",), only_lines=new_set
+                ):
                     logger.debug(diag)
                 seen_advisory.update(new_lines)
         if error_report.has_soft_failures:
@@ -1449,8 +1465,11 @@ def wait_for_replication(
                     "  Soft replication failures (refs missing on remote "
                     "or hidden by source ACL; will not fail verification):"
                 )
+                new_set = set(new_lines)
                 for diag in error_report.format_matches(
-                    sources=("pull_replication_log",), soft_failure=True
+                    sources=("pull_replication_log",),
+                    soft_failure=True,
+                    only_lines=new_set,
                 ):
                     logger.warning(diag)
                 seen_soft_failure.update(new_lines)
@@ -1467,10 +1486,12 @@ def wait_for_replication(
                     "  Magic-repo replication errors (degraded NoteDb "
                     "rendering; user-project replication unaffected):"
                 )
+                new_set = set(new_lines)
                 for diag in error_report.format_matches(
                     sources=("pull_replication_log",),
                     magic_repo=True,
                     soft_failure=False,
+                    only_lines=new_set,
                 ):
                     logger.warning(diag)
                 seen_magic_repo.update(new_lines)
@@ -1484,10 +1505,12 @@ def wait_for_replication(
             ]
             if new_lines:
                 logger.warning("  Authoritative replication-log errors:")
+                new_set = set(new_lines)
                 for diag in error_report.format_matches(
                     sources=("pull_replication_log",),
                     magic_repo=False,
                     soft_failure=False,
+                    only_lines=new_set,
                 ):
                     logger.warning(diag)
                 seen_user_project.update(new_lines)

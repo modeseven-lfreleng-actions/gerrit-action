@@ -1937,6 +1937,133 @@ class TestWaitForReplication:
             f"{[r.getMessage() for r in magic_headings]}"
         )
 
+    @patch("replication.check_replication_errors")
+    @patch("replication.check_pull_replication_log", return_value=True)
+    @patch("replication.check_replication_has_content", return_value=True)
+    @patch("replication.take_snapshot")
+    @patch("replication.count_repositories")
+    @patch("replication.time.sleep")
+    def test_new_match_does_not_reemit_earlier_lines(
+        self,
+        mock_sleep,
+        mock_count,
+        mock_snap,
+        mock_has_content,
+        mock_log_ok,
+        mock_errors,
+        caplog,
+    ):
+        """A new match line on poll N must not re-emit lines from N-1.
+
+        Regression test for the dedup bug Copilot flagged on PR #40:
+        the ``seen_*`` sets gated whether the *heading* was printed,
+        but ``format_matches()`` then dumped every match in the
+        report.  As a result, when poll N discovered ONE new line,
+        the diagnostic block re-printed all previously-seen lines
+        too.  Over a long wait loop with multiple distinct failure
+        lines drifting in, this produced quadratic log volume even
+        with the dedup in place.
+
+        Fix: ``format_matches()`` now accepts an ``only_lines``
+        keyword that scopes the body to the newly-discovered lines.
+        The dedup set still gates the heading; ``only_lines`` scopes
+        the body so each unique match appears exactly once in the
+        whole-loop output.
+        """
+        from replication import (
+            ErrorMatch,
+            ReplicationErrorReport,
+            ReplicationSnapshot,
+            wait_for_replication,
+        )
+
+        # Poll 1: one soft-failure line.  Poll 2: that same line
+        # plus a second new soft-failure line.  Poll 3: all stable.
+        line_a = (
+            "InexistentRefTransportException: "
+            "Ref refs/meta/external-ids does not exist on remote"
+        )
+        line_b = (
+            "InexistentRefTransportException: "
+            "Ref refs/meta/version does not exist on remote"
+        )
+
+        def report_with(*lines: str) -> ReplicationErrorReport:
+            return ReplicationErrorReport(
+                log_file_matches=[
+                    ErrorMatch(
+                        source="pull_replication_log",
+                        pattern="TransportException",
+                        line=line,
+                        is_soft_failure=True,
+                    )
+                    for line in lines
+                ]
+            )
+
+        mock_errors.side_effect = [
+            report_with(line_a),
+            report_with(line_a, line_b),
+            report_with(line_a, line_b),
+        ]
+        # Three polls: under-count, under-count, then at-count to exit.
+        mock_count.side_effect = [5, 5, 5, 10, 10]
+        mock_snap.side_effect = [
+            ReplicationSnapshot(
+                timestamp=100.0,
+                completed_count=5,
+                disk_usage_kb=500000,
+                log_line_count=100,
+                repo_count=5,
+            ),
+            ReplicationSnapshot(
+                timestamp=105.0,
+                completed_count=7,
+                disk_usage_kb=600000,
+                log_line_count=120,
+                repo_count=7,
+            ),
+            ReplicationSnapshot(
+                timestamp=110.0,
+                completed_count=10,
+                disk_usage_kb=700000,
+                log_line_count=140,
+                repo_count=10,
+            ),
+        ]
+
+        docker = MagicMock()
+        with caplog.at_level("WARNING"):
+            result = wait_for_replication(
+                docker,
+                "abc123",
+                "onap",
+                timeout=30,
+                expected_count=10,
+                stability_window=60,
+            )
+        assert result is True
+
+        # Across the whole loop, line_a must appear in the body of
+        # the soft-failure heading exactly once (poll 1), and line_b
+        # must appear exactly once (poll 2).  Without the only_lines
+        # filter, poll 2 would have emitted both line_a and line_b
+        # under its heading, double-printing line_a.
+        all_msgs = "\n".join(rec.getMessage() for rec in caplog.records)
+        assert all_msgs.count("refs/meta/external-ids") == 1, all_msgs
+        assert all_msgs.count("refs/meta/version") == 1, all_msgs
+        # And there should be exactly two soft-failure headings: one
+        # for the new line on poll 1, one for the new line on poll 2.
+        soft_headings = [
+            rec
+            for rec in caplog.records
+            if "Soft replication failures" in rec.getMessage()
+        ]
+        assert len(soft_headings) == 2, (
+            f"expected two soft-failure warnings, got {len(soft_headings)}: "
+            f"{[r.getMessage() for r in soft_headings]}"
+        )
+
     @patch("replication.show_pull_replication_log", return_value="log tail")
     @patch("replication.list_repositories", return_value="repos")
     @patch("replication.get_git_disk_usage_human", return_value="100M")
