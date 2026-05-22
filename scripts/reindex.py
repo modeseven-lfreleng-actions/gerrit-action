@@ -142,14 +142,23 @@ def _flush_caches(client: GerritDevClient, slug: str) -> int:
         except GerritAPIError as exc:
             # Not every Gerrit version exposes every cache name listed
             # above (e.g. ``groups_external`` was renamed across 3.x
-            # minor releases).  404 / Not Implemented is benign — log
-            # at debug and move on.
-            if exc.status_code in (404, 400):
+            # minor releases).  Gerrit's REST handler returns 404 for
+            # an unknown cache name on the
+            # ``POST /a/config/server/caches/<name>/flush`` endpoint;
+            # we treat that single status as benign and continue with
+            # the rest of the curated cache list.  Other 4xx / 5xx
+            # status codes — including 400 ``Expected JSON object``,
+            # which we hit on an earlier round of this branch before
+            # we suppressed the request's Content-Type header — are
+            # genuine errors and must be logged at WARNING, never
+            # silently downgraded.  Narrowing to 404-only here keeps
+            # the next regression of that shape from disappearing
+            # into debug noise.
+            if exc.status_code == 404:
                 logger.debug(
-                    "[%s]   skip cache %s (HTTP %s, not present on this Gerrit)",
+                    "[%s]   skip cache %s (HTTP 404, not present on this Gerrit)",
                     slug,
                     cache_name,
-                    exc.status_code,
                 )
                 continue
             logger.warning("[%s]   failed to flush %s: %s", slug, cache_name, exc)

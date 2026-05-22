@@ -852,10 +852,26 @@ runs:
         inputs.g2p_org_setup == 'provision'
       shell: bash
       run: |
-        # Install PyNaCl for org secret provisioning
+        # Install PyNaCl for org secret provisioning.
+        #
+        # Version pin rationale:
+        # * PyNaCl 1.x has been the stable major for years and
+        #   provides the libsodium ``SealedBox`` API
+        #   ``provision_org_secret()`` calls.  Pinning to the 1.x
+        #   line keeps the action's behaviour stable while still
+        #   picking up patch / minor-version security fixes
+        #   between dispatches.
+        # * Without a pin, an upstream PyNaCl 2.0 release
+        #   (whenever it happens) could drop or rename the
+        #   ``SealedBox`` interface and break every provision-mode
+        #   dispatch with no advance signal.
+        # * The lower bound 1.5 is the first PyNaCl release that
+        #   ships modern manylinux wheels for the cpython versions
+        #   GitHub runners ship today; older releases would force
+        #   a slow source build of libsodium on each run.
         set -euo pipefail
         echo "Installing PyNaCl (user site)…"
-        python3 -m pip install --user --upgrade PyNaCl
+        python3 -m pip install --user --upgrade 'PyNaCl>=1.5,<2'
         python3 -c "import nacl.public; print('PyNaCl OK')"
 
     # Configure G2P (gerrit_to_platform)
