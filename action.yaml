@@ -149,14 +149,29 @@ inputs:
 
         * ``+refs/meta/*:refs/meta/*`` and
           ``+refs/cache-automerge/*:refs/cache-automerge/*`` on every
-          per-project remote (project ACLs + merge-preview cache).
+          per-project remote (per-project ACLs + merge-preview cache).
         * A second ``[remote "<slug>-meta"]`` section targeted at
-          ``All-Users`` and ``All-Projects`` that pulls
-          ``refs/users/*``, ``refs/groups/*``, ``refs/meta/*``,
-          ``refs/sequences/*``, ``refs/draft-comments/*`` and
-          ``refs/starred-changes/*`` — the refs that store account
-          identities, the ``external-ids`` map, group membership, the
-          change-number sequence and global ACLs.
+          ``All-Users`` and ``All-Projects`` that pulls a curated set
+          of enumerated NoteDb refs:
+
+            - ``refs/users/*``, ``refs/groups/*`` (account &
+              group definitions)
+            - ``refs/meta/external-ids`` (login → account_id map)
+            - ``refs/meta/group-names`` (group UUID → name)
+            - ``refs/meta/version`` (NoteDb schema pin)
+            - ``refs/sequences/*`` (change-number sequence)
+            - ``refs/draft-comments/*``, ``refs/starred-changes/*``
+              (per-user state)
+
+      ``refs/meta/config`` is INTENTIONALLY EXCLUDED from the
+      magic-repo remote.  Pulling the source server's
+      ``All-Projects:refs/meta/config`` would overwrite the deployed
+      container's locally-bootstrapped global ACL and silently
+      strip ``administrate-server`` from the bootstrap admin
+      account, breaking the reindex / cache-flush REST calls and
+      the admin UI on the deployed Gerrit.  See the block comment
+      in ``scripts/start-instances.py::generate_replication_config``
+      for the full rationale.
 
       Off by default because it materially increases initial sync
       size on instances with large review histories.  Combine with

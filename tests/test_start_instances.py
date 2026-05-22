@@ -883,8 +883,15 @@ class TestGenerateReplicationConfig:
 
         content = config_file.read_text()
         # Only the per-project remote section's ``fetch =`` lines
-        # should be considered for the de-dup check; the magic-repo
-        # remote section legitimately repeats ``refs/meta/*``.
+        # should be considered for the de-dup check.  The magic-repo
+        # remote section uses enumerated ``refs/meta/<name>``
+        # refspecs (no ``refs/meta/*`` wildcard — see the rationale
+        # in ``generate_replication_config`` for why) so it does NOT
+        # contain ``+refs/meta/*:refs/meta/*`` and would not collide
+        # with the per-project remote's wildcard anyway.  We slice
+        # at the magic-repo header purely to keep this assertion
+        # robust if the magic-repo refspec list ever grows to
+        # include some other ``refs/meta/*`` variant.
         per_project = content.split('[remote "test-meta"]')[0]
         meta_count = per_project.count("fetch = +refs/meta/*:refs/meta/*")
         assert meta_count == 1, (
