@@ -1064,6 +1064,121 @@ class TestCheckReplicationErrors:
         assert "aai/resources.git" in real_only
         assert "InexistentRefTransportException" not in real_only
 
+    def test_soft_failure_propagates_across_stack_trace(self, mock_docker):
+        """Stack-trace frames inherit the headline exception's soft flag.
+
+        Java exceptions span multiple lines: a headline, zero or more
+        ``\tat <FQN>(<file>:<line>)`` frames, and optionally a
+        ``Caused by: <FQN>: ...`` line.  Every line of an
+        ``InexistentRefTransportException`` trace contains some class
+        with ``TransportException`` in its name, so grep returns all
+        of them, but only the headline carries the
+        ``InexistentRefTransportException`` substring.  The frames
+        further down the trace mention the generic
+        ``PermanentTransportException.wrapIfPermanentTransportException``
+        wrapper and the JGit ``Caused by: TransportException:
+        Remote does not have <ref> available for fetch.`` line.
+
+        Without stateful propagation, those frames would each be
+        classified as separate hard user-project errors and the
+        workflow would fail on what is in fact a single soft
+        exception.  This test pins the propagation behaviour against
+        the exact trace shape observed in the 2026-05-22 17:58
+        dispatch.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    # Headline (explicit soft class).
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch."
+                    "InexistentRefTransportException: Ref "
+                    "refs/meta/external-ids does not exist on remote\n"
+                    # First few frames mention the soft class directly.
+                    "\tat com.gerritforge.gerrit.plugins.replication.pull."
+                    "fetch.InexistentRefTransportException."
+                    "wrapException(InexistentRefTransportException."
+                    "java:51)\n"
+                    "\tat com.gerritforge.gerrit.plugins.replication.pull."
+                    "fetch.InexistentRefTransportException."
+                    "getOptionalPermanentFailure("
+                    "InexistentRefTransportException.java:40)\n"
+                    # Wrapper frame: generic, no soft-class mention.
+                    "\tat com.gerritforge.gerrit.plugins.replication.pull."
+                    "fetch.PermanentTransportException."
+                    "wrapIfPermanentTransportException("
+                    "PermanentTransportException.java:31)\n"
+                    # ``Caused by:`` line: matches the JGit-cause
+                    # phrase soft pattern directly.
+                    "Caused by: org.eclipse.jgit.errors."
+                    "TransportException: Remote does not have "
+                    "refs/meta/external-ids available for fetch.\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        # Every matching line must be classified as soft — the
+        # generic ``PermanentTransportException`` wrapper frame
+        # inherits from the preceding ``InexistentRefTransport…``
+        # headline / frames, and the ``Caused by:`` line matches
+        # the JGit cause phrase explicitly.
+        assert len(report.log_file_matches) == 5
+        assert all(m.is_soft_failure for m in report.log_file_matches), [
+            (m.is_soft_failure, m.line[:80]) for m in report.log_file_matches
+        ]
+        # No fatal gate fires.
+        assert report.has_user_project_errors is False
+        assert report.has_magic_repo_errors is False
+        assert report.has_soft_failures is True
+
+    def test_real_failure_after_soft_resets_propagation(self, mock_docker):
+        """A non-soft headline resets the propagation state.
+
+        The propagation must not leak the soft flag across an
+        exception boundary — if a soft trace ends and a real
+        ``Cannot replicate`` failure starts immediately after, the
+        real failure (and any of its own continuation frames) must
+        be classified as a hard user-project error.
+        """
+        from replication import check_replication_errors
+
+        docker, mock_run = mock_docker
+        mock_run.side_effect = [
+            make_completed_process(returncode=0),
+            make_completed_process(
+                stdout=(
+                    # Soft exception (headline + one frame).
+                    "com.gerritforge.gerrit.plugins.replication.pull.fetch."
+                    "InexistentRefTransportException: Ref refs/meta/version "
+                    "does not exist on remote\n"
+                    "\tat com.gerritforge.gerrit.plugins.replication.pull."
+                    "fetch.InexistentRefTransportException.wrapException("
+                    "InexistentRefTransportException.java:51)\n"
+                    # Real failure: new non-continuation headline.
+                    "[2026-05-22 18:00:00,000] [aaa] Cannot replicate from "
+                    "https://gerrit.onap.org/r/a/aai/resources.git\n"
+                    "\tat org.eclipse.jgit.transport.TransportHttp.connect("
+                    "TransportHttp.java:696)\n"
+                )
+            ),
+            make_completed_process(stdout="INFO: ready"),
+        ]
+
+        report = check_replication_errors(docker, "abc123")
+        # Expect 4 matches: soft headline, soft frame, real headline,
+        # real frame inheriting from the real headline.
+        assert len(report.log_file_matches) == 4
+        soft_flags = [m.is_soft_failure for m in report.log_file_matches]
+        assert soft_flags == [True, True, False, False], soft_flags
+        # The user-project gate fires on the real failure.
+        assert report.has_user_project_errors is True
+        assert report.has_soft_failures is True
+
 
 # =========================================================================
 # get_completed_repo_count
