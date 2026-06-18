@@ -475,9 +475,10 @@ class TestLooksLikeMethodMangle:
     response that we have observed when several SSH-key POSTs go down
     a single keepalive connection through certain proxy stacks.  The
     method portion arrives with 1-2 stray bytes prepended (e.g.
-    ``alPOST``, ``lPOST``); the helper must recognise both the clean
-    and mangled forms so the calling code can retry quietly on a
-    fresh connection.
+    ``alPOST``, ``lPOST``).  The helper must recognise the *mangled*
+    forms while NOT treating a clean ``POST`` (a genuine 405) as
+    corruption, so a real "endpoint does not accept POST" error is
+    not silently downgraded into the retry path.
     """
 
     def test_recognises_mangled_alpost(self) -> None:
@@ -488,13 +489,27 @@ class TestLooksLikeMethodMangle:
         )
         assert _looks_like_method_mangle(exc) is True
 
-    def test_recognises_clean_post(self) -> None:
+    def test_clean_post_is_not_mangle(self) -> None:
+        # A clean "POST" verb is a genuine 405 (endpoint truly does
+        # not accept POST), NOT the keepalive-corruption pattern, so
+        # the helper must return False to avoid masking it.
         exc = GerritAPIError(
             "API request failed: Not implemented: POST /r/a/accounts/1/sshkeys",
             status_code=405,
             response_text=("Not implemented: POST /r/a/accounts/1/sshkeys"),
         )
-        assert _looks_like_method_mangle(exc) is True
+        assert _looks_like_method_mangle(exc) is False
+
+    def test_rejects_non_405_status(self) -> None:
+        # Even a mangled-looking verb is not the keepalive pattern
+        # when the status code is not the 405 Gerrit returns for an
+        # unrecognised method.
+        exc = GerritAPIError(
+            "API request failed",
+            status_code=500,
+            response_text="Not implemented: alPOST /r/a/accounts/1/sshkeys",
+        )
+        assert _looks_like_method_mangle(exc) is False
 
     def test_rejects_unrelated_error(self) -> None:
         exc = GerritAPIError(

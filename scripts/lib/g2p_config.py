@@ -100,6 +100,7 @@ def decode_org_tokens(
         If the value cannot be decoded or parsed.
     """
     import base64
+    import binascii
 
     if not b64_value.strip():
         return {}
@@ -110,10 +111,18 @@ def decode_org_tokens(
     normalized = "".join(b64_value.split())
 
     try:
-        decoded = base64.b64decode(normalized, validate=True).decode("utf-8")
-    except Exception as exc:
+        raw = base64.b64decode(normalized, validate=True)
+    except (binascii.Error, ValueError) as exc:
         raise ConfigError(
             f"Failed to decode g2p_org_token_map — bad base64: {exc}"
+        ) from exc
+
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            "Failed to decode g2p_org_token_map — "
+            f"decoded bytes are not valid UTF-8: {exc}"
         ) from exc
 
     try:

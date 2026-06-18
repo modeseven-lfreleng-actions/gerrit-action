@@ -932,6 +932,16 @@ class TestDecodeOrgTokens:
         with pytest.raises(ConfigError, match="bad base64"):
             decode_org_tokens("not-valid-base64!!!")
 
+    def test_non_utf8_bytes(self) -> None:
+        """Valid base64 that decodes to non-UTF-8 bytes is reported as such."""
+        import base64
+
+        # 0xff is never a valid UTF-8 lead byte, so this is valid
+        # base64 but cannot be decoded as UTF-8.
+        b64 = base64.b64encode(b"\xff\xfe").decode()
+        with pytest.raises(ConfigError, match="not valid UTF-8"):
+            decode_org_tokens(b64)
+
     def test_bad_json(self) -> None:
         import base64
 

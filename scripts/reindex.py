@@ -17,11 +17,11 @@ This script closes that gap by:
 1. Connecting to each instance over its mapped HTTP port (the action
    already runs Gerrit in DEVELOPMENT_BECOME_ANY_ACCOUNT mode), and
    becoming an admin account.
-2. Flushing the ``accounts``, ``accounts_byemail``, ``groups``,
-   ``groups_byname``, ``groups_byuuid``, ``groups_members``,
-   ``external_ids_map`` and ``change_notes`` caches so newly
-   replicated ``All-Users`` / ``All-Projects`` refs become visible
-   without a container restart.
+2. Flushing a curated allow-list of caches (see
+   ``_CACHES_TO_FLUSH``) covering the account, group, external-id,
+   change-note and project caches, so newly replicated
+   ``All-Users`` / ``All-Projects`` refs become visible without a
+   container restart.
 3. Listing every project Gerrit knows about and POSTing
    ``/a/projects/<name>/index.changes`` on each one (skipping
    ``All-Users`` and ``All-Projects``, which have no changes of

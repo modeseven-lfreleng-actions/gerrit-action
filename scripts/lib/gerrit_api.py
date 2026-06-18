@@ -116,18 +116,26 @@ def _looks_like_method_mangle(exc: GerritAPIError) -> bool:
     pattern from genuine API errors so we can suppress the noisy
     warning and try once on a fresh connection.
 
-    Returns ``True`` when the error response body matches the
-    "Not implemented:" prefix and includes ``POST`` somewhere after
-    it, regardless of any stray bytes glued onto the verb.
+    Returns ``True`` only when the verb token is an *actually mangled*
+    POST (it ends with ``POST`` but is not exactly ``POST``) and, when
+    the status code is known, it is the ``405 Method Not Allowed`` that
+    Gerrit returns for an unrecognised method.  This avoids masking a
+    genuine ``405`` (e.g. an endpoint that truly does not accept POST),
+    whose verb token is the clean ``POST``.
     """
+    # A real "Not implemented" response uses HTTP 405; if we have a
+    # status code and it is something else, this is not the mangle
+    # pattern.
+    if exc.status_code is not None and exc.status_code != 405:
+        return False
     body = (exc.response_text or str(exc) or "").strip()
     if "Not implemented:" not in body:
         return False
-    after = body.split("Not implemented:", 1)[1]
-    # Look for POST anywhere after the prefix; this matches both the
-    # clean form ("POST /...") and the mangled forms ("alPOST /...",
-    # "lPOST /...").
-    return "POST" in after
+    after = body.split("Not implemented:", 1)[1].strip()
+    # Format is "<method> <uri>"; inspect only the verb token so a
+    # clean "POST /..." (a genuine 405) is not treated as corruption.
+    verb = after.split(None, 1)[0] if after else ""
+    return verb.endswith("POST") and verb != "POST"
 
 
 def _parse_response(response: requests.Response, allow_non_json: bool = False) -> Any:

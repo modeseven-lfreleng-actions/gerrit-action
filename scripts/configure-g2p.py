@@ -204,12 +204,18 @@ def _build_gerrit_info(
         else:
             info["http_url"] = f"http://{ssh_host}:{http_port}/"
 
-        # Build known_hosts from captured SSH host keys
+        # Build known_hosts from captured SSH host keys.  When the SSH
+        # endpoint uses a non-standard port, known_hosts entries must use
+        # the bracketed ``[host]:port`` form so the host key is matched.
         host_keys = meta.get("ssh_host_keys", {})
+        if ssh_port and ssh_port not in ("", "22"):
+            kh_host = f"[{ssh_host}]:{ssh_port}"
+        else:
+            kh_host = ssh_host
         kh_lines: list[str] = []
         for _key_type, key_data in sorted(host_keys.items()):
             if key_data and ssh_host:
-                kh_lines.append(f"{ssh_host} {key_data}")
+                kh_lines.append(f"{kh_host} {key_data}")
         info["known_hosts"] = "\n".join(kh_lines)
 
     # SSH private key from the first setup result
@@ -393,7 +399,20 @@ def run() -> int:
     setup_logging(debug=action_config.debug)
 
     instance_store = InstanceStore(action_config.instances_json_path)
-    instances = instance_store.load()
+    if not action_config.instances_json_path.exists():
+        # A missing instances.json means no containers were started
+        # (for example, when G2P config is generated in a context
+        # without a running deployment).  Treat it the same as an
+        # empty instance set: emit outputs and exit cleanly rather
+        # than failing the action.  Note we only special-case the
+        # *missing-file* condition here — if the file exists but
+        # contains invalid JSON, ``load()`` raises ``ConfigError``
+        # and we deliberately let it propagate, because corrupt
+        # metadata indicates a broken start-instances run that must
+        # fail fast rather than silently skip deployment.
+        instances: dict[str, dict[str, Any]] = {}
+    else:
+        instances = instance_store.load()
 
     if not instances:
         logger.warning(
@@ -551,9 +570,23 @@ def run() -> int:
                 "pre-provision state.",
             )
 
-    # Recompute audit JSON after any provisioning / re-audit work
+    # Recompute audit JSON after any provisioning / re-audit work.
+    # Keep only the documented audit checks (org_secrets /
+    # org_variables / org_access / org_audit) so the
+    # g2p_org_audit_results output stays audit-only.  An allow-list
+    # (rather than excluding the ``provision_`` prefix) ensures that
+    # neither provisioning *action* results nor other non-audit
+    # breadcrumbs such as ``org_provision`` can leak into the
+    # output.  Provisioning outcomes are surfaced separately via
+    # g2p_org_provisioned and the step summary.
     if g2p_config.org_setup != "skip":
-        org_audit_json = results_to_json(org_results)
+        audit_only = [
+            r
+            for r in org_results
+            if r.check_name
+            in ("org_secrets", "org_variables", "org_access", "org_audit")
+        ]
+        org_audit_json = results_to_json(audit_only)
 
     # -- Step 6: Write step summary --------------------------------------
     if check_results or org_results:
