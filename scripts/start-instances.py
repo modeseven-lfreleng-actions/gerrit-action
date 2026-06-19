@@ -711,12 +711,23 @@ def generate_secure_config(
         # for the magic-repo remote.
         content = f"[auth]\n  bearerToken = {config.bearer_token}\n"
     else:
-        # SSH auth — no secure.config needed
+        # SSH auth needs no credentials in secure.config, so the body
+        # is empty.  The file itself is still created (empty, 0600)
+        # below — only its credential contents are unnecessary here.
         content = ""
 
     config_file.parent.mkdir(parents=True, exist_ok=True)
-    config_file.write_text(content, encoding="utf-8")
+    # Create (or truncate) secure.config with 0600 *before* writing
+    # any credentials into it, so there is no transient window where
+    # the file exists with a more permissive umask-derived mode
+    # (e.g. 0644) while it already holds the HTTP password / bearer
+    # token.  touch() creates an empty file; the explicit chmod also
+    # tightens a pre-existing file (O_CREAT does not relax/alter the
+    # mode of an existing file), and write_text() preserves the mode
+    # of the now-existing file.
+    config_file.touch(mode=0o600, exist_ok=True)
     config_file.chmod(0o600)
+    config_file.write_text(content, encoding="utf-8")
 
 
 # =====================================================================
