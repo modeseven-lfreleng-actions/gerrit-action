@@ -35,6 +35,8 @@ jobs:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.1  # yamllint disable-line rule:line-length
+        with:
+          persist-credentials: false
 
       # Cache Docker layers
       - name: 'Cache Docker layers'
@@ -122,6 +124,8 @@ jobs:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.1  # yamllint disable-line rule:line-length
+        with:
+          persist-credentials: false
 
       # Cache Docker layers
       - name: 'Cache Docker layers'
@@ -233,6 +237,8 @@ jobs:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.1  # yamllint disable-line rule:line-length
+        with:
+          persist-credentials: false
 
       # Cache Docker layers
       - name: 'Cache Docker layers'
@@ -368,6 +374,8 @@ jobs:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.1  # yamllint disable-line rule:line-length
+        with:
+          persist-credentials: false
 
       # Test: Missing required input
       - name: "Test: Missing gerrit_setup"
@@ -437,6 +445,8 @@ jobs:
       - name: 'Checkout repository'
         # yamllint disable-line rule:line-length
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6.0.1  # yamllint disable-line rule:line-length
+        with:
+          persist-credentials: false
 
       # Generate ephemeral SSH key for testing
       - name: 'Generate ephemeral SSH key'

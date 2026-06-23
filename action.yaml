@@ -383,7 +383,28 @@ runs:
     - name: 'Setup action/environment'
       id: setup
       shell: bash
-      run: |
+      env:
+        INPUT_GERRIT_SETUP: ${{ inputs.gerrit_setup }}
+        INPUT_AUTH_TYPE: ${{ inputs.auth_type }}
+        INPUT_SSH_PRIVATE_KEY: ${{ inputs.ssh_private_key }}
+        INPUT_HTTP_USERNAME: ${{ inputs.http_username }}
+        INPUT_HTTP_PASSWORD: ${{ inputs.http_password }}
+        INPUT_BEARER_TOKEN: ${{ inputs.bearer_token }}
+        INPUT_BASE_HTTP_PORT: ${{ inputs.base_http_port }}
+        INPUT_BASE_SSH_PORT: ${{ inputs.base_ssh_port }}
+        INPUT_FETCH_EVERY: ${{ inputs.fetch_every }}
+        INPUT_GERRIT_VERSION: ${{ inputs.gerrit_version }}
+        INPUT_PLUGIN_VERSION: ${{ inputs.plugin_version }}
+        INPUT_SYNC_ON_STARTUP: ${{ inputs.sync_on_startup }}
+        INPUT_ENABLE_CACHE: ${{ inputs.enable_cache }}
+      # The only $GITHUB_ENV writes below are WORK_DIR and
+      # INSTANCE_COUNT. WORK_DIR is a PID-based /tmp path (consumed by
+      # later steps) and is not user-controllable. INSTANCE_COUNT is
+      # the numeric output of 'jq length' over gerrit_setup: although
+      # it derives from an input it can only ever be an integer, so it
+      # cannot inject additional environment entries. The github-env
+      # audit is intentionally suppressed for this step.
+      run: | # zizmor: ignore[github-env]
         # Setup Gerrit server action environment and validate configuration
         set -euo pipefail
 
@@ -391,35 +412,35 @@ runs:
         echo "" >> "$GITHUB_STEP_SUMMARY"
 
         # Validate required inputs
-        if [ -z "${{ inputs.gerrit_setup }}" ]; then
+        if [ -z "$INPUT_GERRIT_SETUP" ]; then
           echo "::error::gerrit_setup is a mandatory input ❌"
           exit 1
         fi
 
         # Validate JSON format
-        if ! echo '${{ inputs.gerrit_setup }}' | jq empty 2>/dev/null; then
+        if ! printf '%s' "$INPUT_GERRIT_SETUP" | jq empty 2>/dev/null; then
           echo "::error::gerrit_setup is not valid JSON ❌"
           exit 1
         fi
 
         # Validate authentication
-        AUTH_TYPE="${{ inputs.auth_type }}"
+        AUTH_TYPE="$INPUT_AUTH_TYPE"
         case "$AUTH_TYPE" in
           ssh)
-            if [ -z "${{ inputs.ssh_private_key }}" ]; then
+            if [ -z "$INPUT_SSH_PRIVATE_KEY" ]; then
               echo "::error::ssh_private_key required when auth_type=ssh ❌"
               exit 1
             fi
             ;;
           http_basic)
-            if [ -z "${{ inputs.http_username }}" ] || \
-               [ -z "${{ inputs.http_password }}" ]; then
+            if [ -z "$INPUT_HTTP_USERNAME" ] || \
+               [ -z "$INPUT_HTTP_PASSWORD" ]; then
               echo "::error::http_username and http_password required when auth_type=http_basic ❌"
               exit 1
             fi
             ;;
           bearer_token)
-            if [ -z "${{ inputs.bearer_token }}" ]; then
+            if [ -z "$INPUT_BEARER_TOKEN" ]; then
               echo "::error::bearer_token required when auth_type=bearer_token ❌"
               exit 1
             fi
@@ -431,17 +452,17 @@ runs:
         esac
 
         # Validate port numbers
-        if ! [[ "${{ inputs.base_http_port }}" =~ ^[0-9]+$ ]]; then
+        if ! [[ "$INPUT_BASE_HTTP_PORT" =~ ^[0-9]+$ ]]; then
           echo "::error::base_http_port must be a valid number ❌"
           exit 1
         fi
-        if ! [[ "${{ inputs.base_ssh_port }}" =~ ^[0-9]+$ ]]; then
+        if ! [[ "$INPUT_BASE_SSH_PORT" =~ ^[0-9]+$ ]]; then
           echo "::error::base_ssh_port must be a valid number ❌"
           exit 1
         fi
 
         # Validate fetch_every format
-        FETCH_EVERY="${{ inputs.fetch_every }}"
+        FETCH_EVERY="$INPUT_FETCH_EVERY"
         if ! [[ "$FETCH_EVERY" =~ ^[0-9]+[smhSMH]?$ ]]; then
           echo "::error::fetch_every must be a valid interval (e.g., '60s', '5m', '1h', or '0' to disable) ❌"
           exit 1
@@ -455,22 +476,22 @@ runs:
 
         # Display configuration
         echo "**Configuration** ⚙️" >> "$GITHUB_STEP_SUMMARY"
-        echo "- Gerrit version: \`${{ inputs.gerrit_version }}\`" \
+        echo "- Gerrit version: \`$INPUT_GERRIT_VERSION\`" \
           >> "$GITHUB_STEP_SUMMARY"
-        echo "- Plugin version: \`${{ inputs.plugin_version }}\`" \
+        echo "- Plugin version: \`$INPUT_PLUGIN_VERSION\`" \
           >> "$GITHUB_STEP_SUMMARY"
-        echo "- Auth type: \`${{ inputs.auth_type }}\`" \
+        echo "- Auth type: \`$INPUT_AUTH_TYPE\`" \
           >> "$GITHUB_STEP_SUMMARY"
-        echo "- Sync on startup: \`${{ inputs.sync_on_startup }}\`" \
+        echo "- Sync on startup: \`$INPUT_SYNC_ON_STARTUP\`" \
           >> "$GITHUB_STEP_SUMMARY"
-        echo "- Fetch interval: \`${{ inputs.fetch_every }}\`" \
+        echo "- Fetch interval: \`$INPUT_FETCH_EVERY\`" \
           >> "$GITHUB_STEP_SUMMARY"
-        echo "- Caching enabled: \`${{ inputs.enable_cache }}\`" \
+        echo "- Caching enabled: \`$INPUT_ENABLE_CACHE\`" \
           >> "$GITHUB_STEP_SUMMARY"
         echo "" >> "$GITHUB_STEP_SUMMARY"
 
         # Parse instance count
-        INSTANCE_COUNT=$(echo '${{ inputs.gerrit_setup }}' | jq '. | length')
+        INSTANCE_COUNT=$(printf '%s' "$INPUT_GERRIT_SETUP" | jq '. | length')
         echo "INSTANCE_COUNT=$INSTANCE_COUNT" >> "$GITHUB_ENV"
         echo "**Instances to start:** $INSTANCE_COUNT" >> "$GITHUB_STEP_SUMMARY"
         echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -511,9 +532,11 @@ runs:
     - name: 'Build custom Gerrit image'
       if: inputs.enable_cache == 'true'
       shell: bash
+      env:
+        INPUT_GERRIT_VERSION: ${{ inputs.gerrit_version }}
       run: |
         # Build custom Gerrit image with uv and gerrit_to_platform
-        GERRIT_VERSION="${{ inputs.gerrit_version }}"
+        GERRIT_VERSION="$INPUT_GERRIT_VERSION"
         CUSTOM_IMAGE="gerrit-extended:${GERRIT_VERSION}"
 
         echo "Building custom Gerrit image..."
