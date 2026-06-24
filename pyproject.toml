@@ -34,7 +34,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-mock>=3.10.0",
     "ruff>=0.15.17",
-    "mypy>=1.0.0",
+    "mypy>=2.1.0",
     "types-PyYAML>=6.0",
     "types-requests>=2.33.0.20260518",
 ]
