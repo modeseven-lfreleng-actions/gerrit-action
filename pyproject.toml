@@ -30,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9.1.0",
+    "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "pytest-mock>=3.10.0",
     "ruff>=0.15.17",
@@ -39,7 +39,7 @@ dev = [
     "types-requests>=2.33.0.20260518",
 ]
 test = [
-    "pytest>=9.1.0",
+    "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "pytest-mock>=3.10.0",
 ]
